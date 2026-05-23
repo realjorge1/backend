@@ -19,3 +19,5 @@ setup-placeholders.sh
 TESTING.md
 README.md
 OFFICE_CONVERSIONS_SETUP.md
+test-files/
+*.~qpdf-orig
