@@ -1,0 +1,58 @@
+{
+  "name": "inscribed-backend",
+  "version": "1.0.0",
+  "description": "Inscribed Backend — Document processing, PDF tools, and AI API server",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "npx nodemon src/server.js"
+  },
+  "keywords": [
+    "pdf",
+    "document",
+    "api",
+    "express"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.2",
+    "@google/generative-ai": "^0.24.1",
+    "@signpdf/placeholder-pdf-lib": "^3.3.0",
+    "@signpdf/signer-p12": "^3.3.0",
+    "@signpdf/signpdf": "^3.3.0",
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "express-fileupload": "^1.5.2",
+    "fs-extra": "^11.3.4",
+    "mammoth": "^1.11.0",
+    "muhammara": "^6.0.4",
+    "multer": "^2.1.1",
+    "mupdf": "^1.27.0",
+    "node-forge": "^1.3.3",
+    "node-qpdf2": "^6.0.0",
+    "openai": "^6.21.0",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^2.4.5",
+    "pdf2json": "^4.0.2",
+    "pdf2pic": "^3.2.0",
+    "pdfjs-dist": "^4.10.38",
+    "pdfkit": "^0.17.2",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.34.5",
+    "tesseract.js": "^5.1.1",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "axios": "^1.13.6",
+    "form-data": "^4.0.5",
+    "nodemon": "^3.1.11"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

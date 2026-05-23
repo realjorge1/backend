@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: inscribed-backend
+    runtime: docker
+    plan: free
+    region: oregon
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_URL
+        value: "*"
+      - key: MAX_FILE_SIZE_MB
+        value: "25"
+      - key: UPLOAD_TIMEOUT_MS
+        value: "180000"
+      - key: BODY_LIMIT
+        value: "25mb"
