@@ -21,3 +21,6 @@ README.md
 OFFICE_CONVERSIONS_SETUP.md
 test-files/
 *.~qpdf-orig
+eng.traineddata
+test-files/
+*.~qpdf-orig
