@@ -1,14 +1,16 @@
 /**
  * Office Conversion Service
  *
- * Converts between Office formats and PDF using Node.js-native libraries.
- * LibreOffice is used when available for best fidelity; pure-JS fallbacks
- * handle the case where LibreOffice (or Python) is not installed.
+ * Converts between Office formats and PDF. LibreOffice is the primary engine
+ * (hardened invocation: throwaway profile, hard timeout, serialized via
+ * loQueue so only one soffice process runs at a time).
  *
  * To → PDF:
- *   wordToPDF   – mammoth (DOCX→HTML→PDF) or LibreOffice
- *   excelToPDF  – xlsx (SheetJS) + pdfkit or LibreOffice
- *   pptToPDF    – PPTX ZIP/XML + pdfkit or LibreOffice
+ *   wordToPDF   – LibreOffice, or mammoth (DOCX→HTML→PDF) fallback
+ *   excelToPDF  – LibreOffice, or xlsx (SheetJS) + pdfkit fallback
+ *   pptToPDF    – LibreOffice ONLY. The old text-extraction fallback is gone:
+ *                 it produced unacceptable output while reporting success.
+ *                 Without LibreOffice this throws (statusCode 503).
  *
  * From → PDF:
  *   pdfToWord   – pdf-parse text + hand-built DOCX (adm-zip)
@@ -18,11 +20,31 @@
 
 const { execFile } = require("child_process");
 const util = require("util");
+const crypto = require("crypto");
+const os = require("os");
 const fs = require("fs").promises;
 const fsSync = require("fs");
 const path = require("path");
 
+const { withLibreOfficeLock } = require("../utils/loQueue");
+
 const execFileAsync = util.promisify(execFile);
+
+const LO_TIMEOUT_MS = 120_000; // hard ceiling per conversion
+
+function engineUnavailableError(message) {
+  const err = new Error(message);
+  err.code = "ENGINE_UNAVAILABLE";
+  err.statusCode = 503;
+  return err;
+}
+
+function toFileUrl(absPath) {
+  const normalized = absPath.replace(/\\/g, "/");
+  return /^[a-zA-Z]:/.test(normalized)
+    ? `file:///${normalized}`
+    : `file://${normalized}`;
+}
 
 class OfficeConversionService {
   constructor() {
@@ -34,14 +56,15 @@ class OfficeConversionService {
 
   _detectLibreOffice() {
     const candidates = [
+      process.env.LIBREOFFICE_PATH,
+      "/usr/bin/soffice",
+      "/usr/bin/libreoffice",
+      "/usr/local/bin/soffice",
+      "/usr/local/bin/libreoffice",
+      "/Applications/LibreOffice.app/Contents/MacOS/soffice",
       "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
       "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-      "/usr/bin/libreoffice",
-      "/usr/bin/soffice",
-      "/usr/local/bin/libreoffice",
-      "/usr/local/bin/soffice",
-      "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-    ];
+    ].filter(Boolean);
     for (const p of candidates) {
       if (fsSync.existsSync(p)) return p;
     }
@@ -56,7 +79,8 @@ class OfficeConversionService {
     }
     try {
       await execFileAsync(this._libreOfficePath, ["--version"], {
-        timeout: 5000,
+        timeout: 15000,
+        windowsHide: true,
       });
       this._loAvailable = true;
     } catch {
@@ -65,34 +89,66 @@ class OfficeConversionService {
     return this._loAvailable;
   }
 
-  async _libreOfficeToPDF(inputPath) {
-    const outputDir = path.dirname(inputPath);
-    const outputName = path.basename(inputPath, path.extname(inputPath));
-    const outputPath = path.join(outputDir, `${outputName}.pdf`);
+  /**
+   * Hardened soffice invocation: unique UserInstallation profile (avoids
+   * profile-lock failures), full headless flag set, 120 s timeout with
+   * SIGKILL, serialized through the process-wide LibreOffice queue, and
+   * temp dirs cleaned up afterwards.
+   */
+  async _libreOfficeToPDF(inputPath, originalName) {
+    return withLibreOfficeLock(async () => {
+      const jobId = crypto.randomUUID();
+      const profileDir = path.join(os.tmpdir(), `lo-profile-${jobId}`);
+      const workDir = path.join(os.tmpdir(), `lo-work-${jobId}`);
+      await fs.mkdir(profileDir, { recursive: true });
+      await fs.mkdir(workDir, { recursive: true });
 
-    await execFileAsync(
-      this._libreOfficePath,
-      [
-        "--headless",
-        "--convert-to",
-        "pdf",
-        "--outdir",
-        outputDir,
-        inputPath,
-      ],
-      { timeout: 60000 },
-    );
+      try {
+        // Keep the original extension so LibreOffice picks the right import
+        // filter (temp upload files have no meaningful extension).
+        const ext = path.extname(originalName || inputPath) || "";
+        const namedInput = path.join(workDir, `input${ext}`);
+        await fs.copyFile(inputPath, namedInput);
 
-    const pdfBuffer = await fs.readFile(outputPath);
-    await fs.unlink(outputPath).catch(() => {});
+        await execFileAsync(
+          this._libreOfficePath,
+          [
+            `-env:UserInstallation=${toFileUrl(profileDir)}`,
+            "--headless",
+            "--invisible",
+            "--nodefault",
+            "--norestore",
+            "--nolockcheck",
+            "--nologo",
+            "--nofirststartwizard",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            workDir,
+            namedInput,
+          ],
+          {
+            timeout: LO_TIMEOUT_MS,
+            killSignal: "SIGKILL",
+            windowsHide: true,
+            maxBuffer: 4 * 1024 * 1024,
+          },
+        );
 
-    if (!pdfBuffer || pdfBuffer.length === 0) {
-      throw new Error("LibreOffice produced an empty PDF");
-    }
-    console.log(
-      `[office] LibreOffice converted → ${outputPath} (${pdfBuffer.length} bytes)`,
-    );
-    return pdfBuffer;
+        const outputPath = path.join(workDir, "input.pdf");
+        const pdfBuffer = await fs.readFile(outputPath).catch(() => null);
+        if (!pdfBuffer || pdfBuffer.length === 0) {
+          throw new Error("LibreOffice produced no/empty PDF");
+        }
+        console.log(
+          `[office] LibreOffice converted ${originalName || path.basename(inputPath)} (${pdfBuffer.length} bytes)`,
+        );
+        return pdfBuffer;
+      } finally {
+        fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
+        fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
   }
 
   // ── Word → PDF ────────────────────────────────────────────────────────────
@@ -102,7 +158,7 @@ class OfficeConversionService {
     console.log(`[office] wordToPDF: ${wordFile.name || path.basename(inputPath)}`);
 
     if (await this._isLibreOfficeAvailable()) {
-      return this._libreOfficeToPDF(inputPath);
+      return this._libreOfficeToPDF(inputPath, wordFile.name);
     }
 
     // Fallback: mammoth converts DOCX → HTML; then htmlToPDF renders it
@@ -149,7 +205,7 @@ class OfficeConversionService {
     console.log(`[office] excelToPDF: ${excelFile.name || path.basename(inputPath)}`);
 
     if (await this._isLibreOfficeAvailable()) {
-      return this._libreOfficeToPDF(inputPath);
+      return this._libreOfficeToPDF(inputPath, excelFile.name);
     }
 
     try {
@@ -213,102 +269,16 @@ class OfficeConversionService {
     const inputPath = pptFile.tempFilePath;
     console.log(`[office] pptToPDF: ${pptFile.name || path.basename(inputPath)}`);
 
-    if (await this._isLibreOfficeAvailable()) {
-      return this._libreOfficeToPDF(inputPath);
+    // LibreOffice only — no fallback. The old AdmZip+PDFKit text extractor
+    // silently returned slides stripped of all shapes/colors/tables/charts,
+    // which is worse than an honest failure.
+    if (!(await this._isLibreOfficeAvailable())) {
+      throw engineUnavailableError(
+        "PowerPoint conversion requires LibreOffice, which is not available on this server. " +
+          "No degraded fallback is provided.",
+      );
     }
-
-    // Fallback: PPTX is a ZIP containing XML — extract text, render via pdfkit
-    try {
-      const AdmZip = require("adm-zip");
-      const PDFKit = require("pdfkit");
-
-      const zip = new AdmZip(inputPath);
-      const entries = zip.getEntries();
-
-      // Collect slides
-      const slides = [];
-      for (const entry of entries) {
-        const m = entry.entryName.match(
-          /^ppt\/slides\/slide(\d+)\.xml$/,
-        );
-        if (!m) continue;
-
-        const xml = entry.getData().toString("utf-8");
-        // Extract visible text runs (<a:t>…</a:t>)
-        const textMatches = xml.match(/<a:t[^>]*>([^<]+)<\/a:t>/g) || [];
-        const texts = textMatches
-          .map((t) => t.replace(/<[^>]+>/g, "").trim())
-          .filter(Boolean);
-
-        slides.push({ num: parseInt(m[1], 10), texts });
-      }
-      slides.sort((a, b) => a.num - b.num);
-
-      const pdf = await new Promise((resolve, reject) => {
-        const doc = new PDFKit({
-          size: "A4",
-          layout: "landscape",
-          margins: { top: 50, bottom: 50, left: 55, right: 55 },
-        });
-        const chunks = [];
-        doc.on("data", (c) => chunks.push(c));
-        doc.on("end", () => resolve(Buffer.concat(chunks)));
-        doc.on("error", reject);
-
-        if (slides.length === 0) {
-          doc.text("No text content found in this presentation.");
-        } else {
-          let first = true;
-          for (const slide of slides) {
-            if (!first) doc.addPage();
-            first = false;
-
-            // Slide number (top-right)
-            doc
-              .fontSize(9)
-              .font("Helvetica")
-              .fillColor("#999999")
-              .text(
-                `${slide.num} / ${slides.length}`,
-                { align: "right" },
-              );
-            doc.fillColor("#000000");
-
-            if (slide.texts.length === 0) {
-              doc
-                .fontSize(12)
-                .font("Helvetica")
-                .text("(No text content)", { width: 730 });
-              continue;
-            }
-
-            const [title, ...body] = slide.texts;
-
-            // Title — first text chunk on the slide
-            doc
-              .fontSize(20)
-              .font("Helvetica-Bold")
-              .text(title, { width: 730 });
-            doc.moveDown(0.5);
-
-            // Body content
-            if (body.length > 0) {
-              doc
-                .fontSize(12)
-                .font("Helvetica")
-                .text(body.join("\n"), { width: 730 });
-            }
-          }
-        }
-
-        doc.end();
-      });
-
-      console.log(`[office] pptToPDF (zip+xml): ${pdf.length} bytes`);
-      return pdf;
-    } catch (err) {
-      throw new Error(`PowerPoint to PDF failed: ${err.message}`);
-    }
+    return this._libreOfficeToPDF(inputPath, pptFile.name);
   }
 
   // ── PDF → Word ────────────────────────────────────────────────────────────

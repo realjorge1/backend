@@ -18,10 +18,27 @@ const logger = require("../utils/logger");
 const {
   renderPptxToPdf,
   getRenderedPdfPath,
-  resolveLibreOffice,
+  getEngineInfo,
 } = require("../services/pptxRenderService");
 
 const router = express.Router();
+
+// Map service errors to honest HTTP responses. Engine-missing and conversion
+// failures are 503 (the old silent text-only fallback is gone for good);
+// validation problems are 400. Never 200 with degraded output.
+function sendConversionError(res, err, label) {
+  const status = err.statusCode || 500;
+  logger.error(`[pptx] ${label} failed`, { error: err.message, status });
+  res.status(status).json({
+    error: label === "/render" ? "PPTX render failed" : "PPTX conversion failed",
+    code: err.code || "INTERNAL_ERROR",
+    details: err.message,
+    hint:
+      status === 503
+        ? "LibreOffice engine unavailable or conversion failed on the server. Retry later; do not expect a degraded fallback."
+        : undefined,
+  });
+}
 
 // ── Helpers ────────���─────────────────���──────────────────────────────────────
 
@@ -77,12 +94,7 @@ router.post("/render", async (req, res) => {
     res.setHeader("X-PPTX-Cached", "false");
     sendPdf(res, pdfPath, { inline: true, downloadName });
   } catch (err) {
-    logger.error("[pptx] /render failed", { error: err.message });
-    res.status(500).json({
-      error: "PPTX render failed",
-      details: err.message,
-      hint: "Ensure LibreOffice is installed on the server (LIBREOFFICE_PATH env var).",
-    });
+    sendConversionError(res, err, "/render");
   }
 });
 
@@ -117,12 +129,7 @@ router.post("/convert", async (req, res) => {
       downloadUrl: `/api/pptx/download/${id}`,
     });
   } catch (err) {
-    logger.error("[pptx] /convert failed", { error: err.message });
-    res.status(500).json({
-      error: "PPTX conversion failed",
-      details: err.message,
-      hint: "Ensure LibreOffice is installed on the server (LIBREOFFICE_PATH env var).",
-    });
+    sendConversionError(res, err, "/convert");
   }
 });
 
@@ -157,8 +164,12 @@ router.get("/download/:id", async (req, res) => {
 // --- GET /api/pptx/health --------------------------------------------------
 router.get("/health", async (_req, res) => {
   try {
-    const binary = await resolveLibreOffice();
-    res.json({ status: "ok", libreOffice: binary });
+    const { binary, version } = await getEngineInfo();
+    res.json({
+      status: "ok",
+      engine: version || "LibreOffice (version unknown)",
+      libreOffice: binary,
+    });
   } catch (err) {
     res.status(503).json({ status: "unavailable", error: err.message });
   }

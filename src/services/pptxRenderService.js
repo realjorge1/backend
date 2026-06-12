@@ -4,6 +4,11 @@
 // Converts .pptx / .ppt files to PDF via LibreOffice headless so the mobile
 // client can display them through its existing react-native-pdf viewer.
 //
+// LibreOffice is the ONLY engine. There is deliberately no fallback: the old
+// text-extraction fallback (AdmZip + PDFKit) produced unacceptable output
+// while reporting success. If LibreOffice is missing or fails, callers get a
+// typed error (statusCode 503) and must surface it honestly.
+//
 // Intentionally self-contained — does NOT import officeConversionService or
 // any other shared converter. No coupling with PDF / DOCX / EPUB subsystems.
 // ============================================================================
@@ -12,17 +17,49 @@ const { execFile } = require("child_process");
 const util = require("util");
 const fs = require("fs");
 const fsp = require("fs").promises;
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 
 const { OUTPUTS_DIR } = require("../utils/fileOutputUtils");
+const { withLibreOfficeLock } = require("../utils/loQueue");
 const logger = require("../utils/logger");
 
 const execFileAsync = util.promisify(execFile);
 
 const CONVERSION_TIMEOUT_MS = 120_000; // 2 min hard ceiling per job
+const VERSION_PROBE_TIMEOUT_MS = 15_000;
 const MAX_INPUT_BYTES = 100 * 1024 * 1024; // 100 MB upper bound guard
 const HASH_ALGO = "sha256";
+
+// ── Typed errors ─────────────────────────────────────────────────────────────
+
+class EngineUnavailableError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "EngineUnavailableError";
+    this.code = "ENGINE_UNAVAILABLE";
+    this.statusCode = 503;
+  }
+}
+
+class ConversionFailedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ConversionFailedError";
+    this.code = "CONVERSION_FAILED";
+    this.statusCode = 503;
+  }
+}
+
+class InvalidInputError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "InvalidInputError";
+    this.code = "INVALID_INPUT";
+    this.statusCode = 400;
+  }
+}
 
 // ── LibreOffice binary resolution ───────────────────────────────────────────
 
@@ -30,36 +67,70 @@ const CANDIDATE_BINARIES = [
   process.env.LIBREOFFICE_PATH,
   "soffice",
   "libreoffice",
-  "/usr/bin/libreoffice",
   "/usr/bin/soffice",
+  "/usr/bin/libreoffice",
   "/opt/libreoffice/program/soffice",
   "/Applications/LibreOffice.app/Contents/MacOS/soffice",
   "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
   "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
 ].filter(Boolean);
 
-let cachedBinaryPath = null;
+let cachedEngine = null; // { binary, version }
 
-async function resolveLibreOffice() {
-  if (cachedBinaryPath) return cachedBinaryPath;
+function parseVersion(stdout) {
+  // "LibreOffice 7.4.7.2 40(Build:2)" → "LibreOffice 7.4.7.2"
+  const m = String(stdout || "").match(/LibreOffice\s+[\d.]+/i);
+  return m ? m[0] : null;
+}
+
+async function probeVersion(binary) {
+  try {
+    const { stdout } = await execFileAsync(binary, ["--version"], {
+      timeout: VERSION_PROBE_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    return parseVersion(stdout);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Locate the LibreOffice binary and cache it together with its version
+ * string (from `soffice --version`, probed once at first resolution).
+ * Throws EngineUnavailableError when no binary is usable.
+ */
+async function getEngineInfo() {
+  if (cachedEngine) return cachedEngine;
 
   for (const candidate of CANDIDATE_BINARIES) {
     try {
       if (path.isAbsolute(candidate)) {
         await fsp.access(candidate, fs.constants.X_OK);
-        cachedBinaryPath = candidate;
-        return candidate;
+        cachedEngine = {
+          binary: candidate,
+          version: await probeVersion(candidate),
+        };
+        return cachedEngine;
       }
-      await execFileAsync(candidate, ["--version"], { timeout: 5000 });
-      cachedBinaryPath = candidate;
-      return candidate;
+      // Bare command name — the version probe doubles as the existence check
+      const { stdout } = await execFileAsync(candidate, ["--version"], {
+        timeout: VERSION_PROBE_TIMEOUT_MS,
+        windowsHide: true,
+      });
+      cachedEngine = { binary: candidate, version: parseVersion(stdout) };
+      return cachedEngine;
     } catch {
-      // try next
+      // try next candidate
     }
   }
-  throw new Error(
+  throw new EngineUnavailableError(
     "LibreOffice not found. Install LibreOffice and/or set LIBREOFFICE_PATH env var.",
   );
+}
+
+async function resolveLibreOffice() {
+  return (await getEngineInfo()).binary;
 }
 
 // ── Validation helpers ──────────────────────────────────────────────────────
@@ -67,7 +138,7 @@ async function resolveLibreOffice() {
 function assertPptxExtension(filename) {
   const ext = path.extname(filename || "").toLowerCase();
   if (ext !== ".pptx" && ext !== ".ppt") {
-    throw new Error(`Unsupported file extension: ${ext || "(none)"}`);
+    throw new InvalidInputError(`Unsupported file extension: ${ext || "(none)"}`);
   }
 }
 
@@ -78,10 +149,10 @@ function getOriginalExtension(filename) {
 
 async function assertReadable(filePath) {
   const stat = await fsp.stat(filePath);
-  if (!stat.isFile()) throw new Error("Input is not a regular file");
-  if (stat.size === 0) throw new Error("Input file is empty");
+  if (!stat.isFile()) throw new InvalidInputError("Input is not a regular file");
+  if (stat.size === 0) throw new InvalidInputError("Input file is empty");
   if (stat.size > MAX_INPUT_BYTES) {
-    throw new Error(
+    throw new InvalidInputError(
       `Input file too large (${stat.size} bytes, max ${MAX_INPUT_BYTES})`,
     );
   }
@@ -128,6 +199,101 @@ function toFileUrl(absPath) {
   return `file://${normalized}`;
 }
 
+// ── LibreOffice invocation ──────────────────────────────────────────────────
+
+/**
+ * Run one `soffice --convert-to pdf` job in a throwaway profile + work dir.
+ * Must be called under withLibreOfficeLock(). Returns the path of the PDF
+ * inside workDir; the caller copies it out and then removes workDir. The
+ * profile dir is always removed here; on failure workDir is removed too.
+ */
+async function sofficeConvert(binary, inputPath, ext, outputBaseName) {
+  const jobId = crypto.randomUUID();
+  // Unique profile per job avoids LibreOffice profile-lock failures; unique
+  // work dir keeps concurrent request files apart and makes cleanup trivial.
+  const profileDir = path.join(os.tmpdir(), `lo-profile-${jobId}`);
+  const workDir = path.join(os.tmpdir(), `lo-work-${jobId}`);
+
+  await fsp.mkdir(profileDir, { recursive: true });
+  await fsp.mkdir(workDir, { recursive: true });
+
+  try {
+    const namedInput = path.join(workDir, `${outputBaseName}${ext}`);
+    await fsp.copyFile(inputPath, namedInput);
+
+    try {
+      await execFileAsync(
+        binary,
+        [
+          `-env:UserInstallation=${toFileUrl(profileDir)}`,
+          "--headless",
+          "--invisible",
+          "--nodefault",
+          "--norestore",
+          "--nolockcheck",
+          "--nologo",
+          "--nofirststartwizard",
+          "--convert-to",
+          "pdf",
+          "--outdir",
+          workDir,
+          namedInput,
+        ],
+        {
+          timeout: CONVERSION_TIMEOUT_MS,
+          killSignal: "SIGKILL", // guarantee the process dies on expiry
+          windowsHide: true,
+          maxBuffer: 4 * 1024 * 1024,
+        },
+      );
+    } catch (err) {
+      if (err.killed || err.signal) {
+        throw new ConversionFailedError(
+          `LibreOffice timed out after ${CONVERSION_TIMEOUT_MS / 1000}s and was killed`,
+        );
+      }
+      const stderr = (err.stderr || "").toString().trim().slice(0, 500);
+      throw new ConversionFailedError(
+        `LibreOffice failed: ${stderr || err.message}`,
+      );
+    }
+
+    const producedPdf = path.join(workDir, `${outputBaseName}.pdf`);
+    let stat;
+    try {
+      stat = await fsp.stat(producedPdf);
+    } catch {
+      const files = await fsp.readdir(workDir).catch(() => []);
+      throw new ConversionFailedError(
+        `LibreOffice produced no PDF (workDir contains: ${files.join(", ") || "empty"})`,
+      );
+    }
+    if (stat.size === 0) {
+      throw new ConversionFailedError("LibreOffice produced an empty PDF");
+    }
+
+    return producedPdf;
+  } catch (err) {
+    await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  } finally {
+    fsp.rm(profileDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function convertToCachedPdf(binary, inputPath, ext, fileHash) {
+  const producedPdf = await sofficeConvert(binary, inputPath, ext, "input");
+  const workDir = path.dirname(producedPdf);
+  try {
+    const finalPath = cachedPdfPath(fileHash);
+    await fsp.copyFile(producedPdf, finalPath);
+    const stat = await fsp.stat(finalPath);
+    return { id: fileHash, pdfPath: finalPath, sizeBytes: stat.size };
+  } finally {
+    fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 // ── Core conversion ─────────────────────────────────────────────────────────
 
 /**
@@ -137,12 +303,18 @@ function toFileUrl(absPath) {
  * Uses hash-based caching: if the same file was converted before and the PDF
  * is still on disk, the cached copy is returned instantly.
  *
+ * Throws:
+ *   InvalidInputError      (400) — bad extension / empty / oversized input
+ *   EngineUnavailableError (503) — LibreOffice not installed
+ *   ConversionFailedError  (503) — LibreOffice crashed, timed out, or
+ *                                  produced no usable PDF
+ *
  * @param {string} inputPath  absolute path to the source .pptx (temp file)
  * @param {string} [originalName] original filename — used for extension detection
  * @returns {Promise<{ id: string, pdfPath: string, sizeBytes: number }>}
  */
 async function renderPptxToPdf(inputPath, originalName) {
-  if (!inputPath) throw new Error("inputPath is required");
+  if (!inputPath) throw new InvalidInputError("inputPath is required");
   assertPptxExtension(originalName || inputPath);
   await assertReadable(inputPath);
 
@@ -153,73 +325,50 @@ async function renderPptxToPdf(inputPath, originalName) {
     return { id: fileHash, pdfPath: cached.pdfPath, sizeBytes: cached.sizeBytes };
   }
 
-  // ── Try LibreOffice first ────────────────────────────────────────
-  let pdfBuffer = null;
+  // ── Convert via LibreOffice (the only engine — no fallback) ─────
+  const { binary } = await getEngineInfo();
+  const ext = getOriginalExtension(originalName || inputPath);
 
-  try {
-    const binary = await resolveLibreOffice();
-
-    const jobId = crypto.randomUUID();
-    const profileDir = path.join(OUTPUTS_DIR, `lo_profile_${jobId}`);
-    const workDir = path.join(OUTPUTS_DIR, `lo_work_${jobId}`);
-
-    await fsp.mkdir(profileDir, { recursive: true });
-    await fsp.mkdir(workDir, { recursive: true });
-
-    const ext = getOriginalExtension(originalName || inputPath);
-    const namedInput = path.join(workDir, `input${ext}`);
-    await fsp.copyFile(inputPath, namedInput);
-
-    try {
-      await execFileAsync(
-        binary,
-        [
-          `-env:UserInstallation=${toFileUrl(profileDir)}`,
-          "--headless",
-          "--norestore",
-          "--nologo",
-          "--nodefault",
-          "--nofirststartwizard",
-          "--convert-to",
-          "pdf",
-          "--outdir",
-          workDir,
-          namedInput,
-        ],
-        { timeout: CONVERSION_TIMEOUT_MS, windowsHide: true },
-      );
-
-      const producedPdf = path.join(workDir, "input.pdf");
-      if (!fs.existsSync(producedPdf)) {
-        const files = await fsp.readdir(workDir).catch(() => []);
-        throw new Error(
-          `LibreOffice produced no PDF (workDir contains: ${files.join(", ") || "empty"})`,
-        );
-      }
-      pdfBuffer = await fsp.readFile(producedPdf);
-    } finally {
-      fsp.rm(profileDir, { recursive: true, force: true }).catch(() => {});
-      fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  return withLibreOfficeLock(async () => {
+    // Re-check the cache: an identical file may have been converted while
+    // this job sat in the queue.
+    const nowCached = await getCachedPdf(fileHash);
+    if (nowCached) {
+      return { id: fileHash, pdfPath: nowCached.pdfPath, sizeBytes: nowCached.sizeBytes };
     }
-  } catch (loErr) {
-    // LibreOffice not installed or failed — fall back to pure-JS converter
-    logger.warn(`[pptx] LibreOffice unavailable (${loErr.message}), using JS fallback`);
-  }
+    return convertToCachedPdf(binary, inputPath, ext, fileHash);
+  });
+}
 
-  // ── JS fallback: AdmZip + PDFKit (no system deps required) ──────
-  if (!pdfBuffer) {
-    const officeService = require("./officeConversionService");
-    pdfBuffer = await officeService.pptToPDF({
-      tempFilePath: inputPath,
-      name: originalName || path.basename(inputPath),
+// ── Boot warm-up ────────────────────────────────────────────────────────────
+
+/**
+ * Run one trivial conversion at server start so the first real request does
+ * not pay LibreOffice's first-run initialization cost (binary + library load,
+ * font cache). Failure is non-fatal: it just logs a warning, and /api/pptx
+ * endpoints keep reporting an honest 503 until LibreOffice is available.
+ */
+async function warmUpLibreOffice() {
+  const startedAt = Date.now();
+  try {
+    const { binary, version } = await getEngineInfo();
+    const seed = path.join(os.tmpdir(), `lo-warmup-${crypto.randomUUID()}.txt`);
+    await fsp.writeFile(seed, "warm-up\n", "utf8");
+    try {
+      const producedPdf = await withLibreOfficeLock(() =>
+        sofficeConvert(binary, seed, ".txt", "warmup"),
+      );
+      await fsp.rm(path.dirname(producedPdf), { recursive: true, force: true });
+    } finally {
+      fsp.rm(seed, { force: true }).catch(() => {});
+    }
+    logger.info("[pptx] LibreOffice warm-up complete", {
+      engine: version || "unknown version",
+      ms: Date.now() - startedAt,
     });
+  } catch (err) {
+    logger.warn(`[pptx] LibreOffice warm-up skipped: ${err.message}`);
   }
-
-  // ── Persist to hash-keyed cache ──────────────────────────────────
-  const finalPath = cachedPdfPath(fileHash);
-  await fsp.writeFile(finalPath, pdfBuffer);
-  const stat = await fsp.stat(finalPath);
-  return { id: fileHash, pdfPath: finalPath, sizeBytes: stat.size };
 }
 
 /**
@@ -252,4 +401,9 @@ module.exports = {
   renderPptxToPdf,
   getRenderedPdfPath,
   resolveLibreOffice,
+  getEngineInfo,
+  warmUpLibreOffice,
+  EngineUnavailableError,
+  ConversionFailedError,
+  InvalidInputError,
 };

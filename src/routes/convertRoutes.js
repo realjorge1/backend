@@ -130,7 +130,7 @@ router.post("/word-to-pdf", async (req, res) => {
     res.send(resultPdf);
   } catch (error) {
     console.error("Word to PDF error:", error);
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       error: "Failed to convert Word to PDF",
       details: error.message,
       hint: "Ensure LibreOffice is installed on the server",
@@ -154,8 +154,9 @@ router.post("/ppt-to-pdf", async (req, res) => {
     res.send(resultPdf);
   } catch (error) {
     console.error("PowerPoint to PDF error:", error);
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       error: "Failed to convert PowerPoint to PDF",
+      code: error.code || "INTERNAL_ERROR",
       details: error.message,
       hint: "Ensure LibreOffice is installed on the server",
     });
@@ -178,7 +179,7 @@ router.post("/excel-to-pdf", async (req, res) => {
     res.send(resultPdf);
   } catch (error) {
     console.error("Excel to PDF error:", error);
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       error: "Failed to convert Excel to PDF",
       details: error.message,
       hint: "Ensure LibreOffice is installed on the server",

@@ -217,6 +217,13 @@ const server = app.listen(config.port, config.host, () => {
 
   logger.info("Ready to receive requests");
   logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+  // Warm up LibreOffice (fire-and-forget): pre-loads the binary/libraries so
+  // the first real PPTX conversion doesn't pay first-run initialization.
+  // Non-fatal if LibreOffice is absent — /api/pptx/* will report 503 honestly.
+  require("./services/pptxRenderService")
+    .warmUpLibreOffice()
+    .catch((err) => logger.warn(`LibreOffice warm-up error: ${err.message}`));
 });
 
 // Graceful shutdown
