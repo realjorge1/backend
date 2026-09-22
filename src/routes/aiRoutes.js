@@ -51,6 +51,18 @@ function sendError(res, task, err) {
     return sendStoreUnavailable(res, err);
   }
 
+  // The model could not produce usable structured output, even after a retry
+  // (contract C8). This is an application error, not a dead instance, so it
+  // must not be a 502/503/504 that would send the app to the other server.
+  if (code === "AI_BAD_OUTPUT") {
+    logger.error(`AI route error [${task}]`, { code, message: err.message });
+    return res.status(500).json({
+      success: false,
+      code: "AI_BAD_OUTPUT",
+      error: err.message || "The model returned an unusable result.",
+    });
+  }
+
   const status =
     code === "VALIDATION_ERROR"
       ? 400
@@ -659,6 +671,90 @@ router.post("/quiz", async (req, res) => {
     res.json(taskResponse(result, { data: result.data.json || result.data.text }));
   } catch (err) {
     sendError(res, "quiz", err);
+  }
+});
+
+// ============================================
+// POST /api/ai/devils-advocate — hardest objections to a document
+// POST /api/ai/narrative-arc  — is the story told in the right order
+//
+// Both previously 404'd, so the app built the prompt itself and squeezed it
+// through /chat against a 12k-character excerpt. They now run server-side
+// over the whole document and validate their own output.
+// ============================================
+
+/**
+ * Resolve the optional second document these two routes accept, either by id
+ * or as inline text, capped so it can't crowd out the main document.
+ */
+async function resolveContext(req, { contextDocId, contextText }, budgetChars) {
+  if (contextDocId) {
+    const doc = await getDocument(contextDocId, { userHash: req.userHash });
+    if (!doc) {
+      const err = new Error("Context document not found or expired.");
+      err.code = "DOC_NOT_FOUND";
+      throw err;
+    }
+    const text = (doc.units || []).map((u) => `[${u.label}]\n${u.text}`).join("\n\n");
+    return {
+      contextText: text.slice(0, budgetChars),
+      contextName: doc.filename,
+    };
+  }
+
+  if (typeof contextText === "string" && contextText.trim()) {
+    return { contextText: contextText.slice(0, budgetChars), contextName: undefined };
+  }
+
+  return { contextText: undefined, contextName: undefined };
+}
+
+router.post("/devils-advocate", async (req, res) => {
+  try {
+    const file = req.files?.document || req.files?.file || null;
+    const { text, documentName, role, customRole, contextName } = req.body || {};
+    validateLength(text, "text");
+
+    const context = await resolveContext(req, req.body || {}, 6000);
+
+    const result = await aiService.run("devils-advocate", {
+      ...documentTaskParams(req),
+      text,
+      file,
+      documentName,
+      role,
+      customRole,
+      contextText: context.contextText,
+      contextName: context.contextName || contextName,
+    });
+
+    res.json(taskResponse(result));
+  } catch (err) {
+    sendError(res, "devils-advocate", err);
+  }
+});
+
+router.post("/narrative-arc", async (req, res) => {
+  try {
+    const file = req.files?.document || req.files?.file || null;
+    const { text, documentName, format, contextName } = req.body || {};
+    validateLength(text, "text");
+
+    const context = await resolveContext(req, req.body || {}, 5000);
+
+    const result = await aiService.run("narrative-arc", {
+      ...documentTaskParams(req),
+      text,
+      file,
+      documentName,
+      format,
+      contextText: context.contextText,
+      contextName: context.contextName || contextName,
+    });
+
+    res.json(taskResponse(result));
+  } catch (err) {
+    sendError(res, "narrative-arc", err);
   }
 });
 
