@@ -1,87 +1,39 @@
 /**
  * Document Chat Service
- * Handles multi-turn conversational RAG for documents.
- * Combines embedding-based retrieval with conversation history.
+ * Multi-turn conversational RAG over a stored document.
  */
 
 const aiProvider = require("./aiProvider");
 const aiConfig = require("../config/aiConfig");
-const {
-  generateEmbeddings,
-  generateSingleEmbedding,
-} = require("./embeddingService");
-const { hybridSearch } = require("./vectorStore");
+const { retrieveForQuestion, buildContext } = require("./retrieval");
 const logger = require("../utils/logger");
 
-const MAX_CHUNKS_PER_QUERY = 6;
-const MAX_CONTEXT_CHARS = 14000;
 const MAX_HISTORY_MESSAGES = 10;
 
 /**
- * Process a document's chunks by generating embeddings for them.
- * Returns chunks with their embeddings attached.
- *
- * @param {Array<{chunkId, text, pages}>} chunks
- * @returns {Promise<{chunkEmbeddings: Array, embeddingProvider: string}>}
+ * Chat models are configured per provider. CLAUDE_CHAT_MODEL is a Claude
+ * model id, so passing it to OpenAI or Gemini would be a guaranteed error —
+ * only send it when Claude is actually the active provider.
  */
-async function embedDocumentChunks(chunks) {
-  if (!chunks || chunks.length === 0) {
-    return { chunkEmbeddings: [], embeddingProvider: "none" };
-  }
-
-  const texts = chunks.map((c) => c.text);
-  const { embeddings, provider } = await generateEmbeddings(texts);
-
-  const chunkEmbeddings = chunks.map((chunk, idx) => ({
-    ...chunk,
-    embedding: embeddings[idx] || [],
-  }));
-
-  logger.info(
-    `[docChat] Embedded ${chunkEmbeddings.length} chunks via ${provider}`,
-  );
-
-  return { chunkEmbeddings, embeddingProvider: provider };
+function chatModelFor(provider) {
+  return provider === "claude" ? aiConfig.claude.chatModel : undefined;
 }
 
 /**
- * Answer a question about a document using RAG with conversation history.
+ * Answer a question about a stored document.
  *
- * @param {string} question - Current user question
- * @param {Array<{chunkId, text, pages, embedding}>} chunkEmbeddings - Pre-embedded chunks
- * @param {Object} meta - Document metadata
- * @param {Array<{role, content}>} history - Previous conversation messages
- * @param {string} embeddingProvider - Which provider generated the embeddings
- * @returns {Promise<{answer: string, citations: Array, found: boolean}>}
+ * @param {string} question
+ * @param {object} doc      stored document (units, chunks, meta, embedding)
+ * @param {Array<{role, content}>} history
+ * @returns {Promise<{answer, citations, found, retrievedChunks, retrieval}>}
  */
-async function chatWithDocument(
-  question,
-  chunkEmbeddings,
-  meta,
-  history = [],
-  embeddingProvider = "local",
-) {
-  // 1. Generate embedding for the question
-  const { embedding: queryEmbedding } = await generateSingleEmbedding(question);
+async function chatWithDocument(question, doc, history = []) {
+  const retrieved = await retrieveForQuestion(doc, question);
+  const context = buildContext(retrieved.chunks);
 
-  // 2. Retrieve relevant chunks using hybrid search
-  const relevantChunks = hybridSearch(
-    question,
-    queryEmbedding,
-    chunkEmbeddings,
-    MAX_CHUNKS_PER_QUERY,
-  );
+  const messages = [{ role: "system", content: buildChatSystemPrompt(doc.meta || {}) }];
 
-  // 3. Build context from retrieved chunks
-  const context = buildContext(relevantChunks, MAX_CONTEXT_CHARS);
-
-  // 4. Build conversation messages
-  const systemPrompt = buildChatSystemPrompt(meta);
-  const messages = [{ role: "system", content: systemPrompt }];
-
-  // Add trimmed conversation history
-  const trimmedHistory = (history || []).slice(-MAX_HISTORY_MESSAGES);
-  for (const msg of trimmedHistory) {
+  for (const msg of (history || []).slice(-MAX_HISTORY_MESSAGES)) {
     if (msg.role && msg.content) {
       messages.push({
         role: msg.role === "assistant" ? "assistant" : "user",
@@ -90,25 +42,27 @@ async function chatWithDocument(
     }
   }
 
-  // Add current question with context
-  const userMessage = buildContextualQuestion(question, context);
-  messages.push({ role: "user", content: userMessage });
+  messages.push({ role: "user", content: buildContextualQuestion(question, context) });
 
-  // 5. Call LLM
   try {
     const result = await aiProvider.chat(messages, {
       temperature: 0.3,
       maxTokens: 1500,
-      model: aiConfig.claude.chatModel,
+      model: chatModelFor(aiProvider.currentProvider),
     });
 
-    // 6. Parse and return the response
     const parsed = parseResponse(result.content);
     return {
       ...parsed,
-      retrievedChunks: relevantChunks.map((c) => ({
+      usage: result.usage,
+      provider: result.provider,
+      retrieval: {
+        mode: retrieved.mode,
+        embeddingProvider: retrieved.embeddingProvider,
+      },
+      retrievedChunks: retrieved.chunks.map((c) => ({
         chunkId: c.chunkId,
-        pages: c.pages,
+        pages: c.unitIndexes || c.pages || [],
         score: c.score,
         preview: c.text.slice(0, 150),
       })),
@@ -149,31 +103,11 @@ ${context}
 Question: ${question}`;
 }
 
-function buildContext(chunks, maxChars) {
-  let context = "";
-  for (const chunk of chunks) {
-    const snippet = chunk.text;
-    if (context.length + snippet.length > maxChars) {
-      // Add as much as we can
-      const remaining = maxChars - context.length - 10;
-      if (remaining > 200) {
-        context += snippet.slice(0, remaining) + "...\n\n---\n\n";
-      }
-      break;
-    }
-    context += snippet + "\n\n---\n\n";
-  }
-  return context.trim();
-}
-
 function parseResponse(rawAnswer) {
-  // Try to parse structured response if the LLM returns JSON
   try {
     let jsonStr = rawAnswer;
     const jsonMatch = rawAnswer.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[1];
-    }
+    if (jsonMatch) jsonStr = jsonMatch[1];
 
     const parsed = JSON.parse(jsonStr);
     if (parsed.answer) {
@@ -184,10 +118,9 @@ function parseResponse(rawAnswer) {
       };
     }
   } catch {
-    // Not JSON — that's fine, use plain text
+    // Not JSON — plain text is fine.
   }
 
-  // Extract inline citations from plain text: "(Page N)" or "(Chapter N)"
   const citations = [];
   const citationRegex = /\((?:Page|Chapter)\s+(\d+)\)/gi;
   let match;
@@ -205,4 +138,4 @@ function parseResponse(rawAnswer) {
   };
 }
 
-module.exports = { embedDocumentChunks, chatWithDocument };
+module.exports = { chatWithDocument, chatModelFor };

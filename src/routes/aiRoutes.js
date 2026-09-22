@@ -809,13 +809,14 @@ router.post("/ask-pdf", async (req, res) => {
 
     logger.info(`[ask-pdf] docId=${docId} (${question.length} char question)`);
 
-    const result = await askPdf(question.trim(), doc.chunks, doc.meta);
+    const result = await askPdf(question.trim(), doc);
 
     res.json({
       question: question.trim(),
       answer: result.answer,
       citations: result.citations,
       found: result.found,
+      retrieval: result.retrieval,
       docMeta: {
         filename: doc.meta.filename,
         totalPages: doc.meta.totalPages,
@@ -960,26 +961,10 @@ router.post("/chat-document", async (req, res) => {
     const parsedHistory =
       typeof history === "string" ? JSON.parse(history) : history || [];
 
-    // Use embedding-based retrieval if embeddings are available
-    let result;
-    if (
-      doc.chunkEmbeddings &&
-      doc.chunkEmbeddings.length > 0 &&
-      doc.chunkEmbeddings[0].embedding &&
-      doc.chunkEmbeddings[0].embedding.length > 0
-    ) {
-      result = await chatWithDocument(
-        question.trim(),
-        doc.chunkEmbeddings,
-        doc.meta,
-        parsedHistory,
-        doc.embeddingProvider,
-      );
-    } else {
-      // Fallback to keyword-based Q&A
-      result = await askPdf(question.trim(), doc.chunks, doc.meta);
-      result.retrievedChunks = [];
-    }
+    // One retrieval path for every document: hybrid when the document has
+    // real embeddings and the question could be embedded the same way,
+    // keyword otherwise.
+    const result = await chatWithDocument(question.trim(), doc, parsedHistory);
 
     res.json({
       question: question.trim(),
@@ -987,6 +972,7 @@ router.post("/chat-document", async (req, res) => {
       citations: result.citations,
       found: result.found,
       retrievedChunks: result.retrievedChunks || [],
+      retrieval: result.retrieval,
       docMeta: {
         filename: doc.meta.filename,
         fileType: doc.meta.fileType || "pdf",

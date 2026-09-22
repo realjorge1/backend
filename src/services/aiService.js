@@ -1295,73 +1295,13 @@ function validateQuizQuestions(parsed, docText, requestedCount) {
 }
 
 /**
- * Build a retrieval context from a stored document's chunks. Samples diverse
- * chunks (first, evenly-spaced middles, last, and any chunk mentioning weak
- * topics) up to a character budget to feed the LLM grounded material.
+ * Build a retrieval context from a stored document for quiz generation.
+ * Delegates to the shared retrieval module so quizzes are grounded by the
+ * same scoring that answers questions.
  */
-function buildRetrievalContext(doc, { weakTopics = [], budgetChars = 12000 } = {}) {
+function buildRetrievalContext(doc, options = {}) {
   if (!doc) return "";
-
-  // Prefer pre-built chunks; otherwise synthesize chunks from stored pages so
-  // tiny documents (1-page PDFs, short DOCX) still produce retrieval context.
-  let chunks = Array.isArray(doc.chunks) ? doc.chunks : [];
-  if (chunks.length === 0 && Array.isArray(doc.pages) && doc.pages.length > 0) {
-    chunks = doc.pages
-      .filter((p) => p && typeof p.text === "string" && p.text.trim().length > 0)
-      .map((p, idx) => ({
-        chunkId: idx,
-        text: `[Page ${p.page ?? idx + 1}]\n${p.text.trim()}`,
-        pages: [p.page ?? idx + 1],
-      }));
-  }
-  if (chunks.length === 0) return "";
-  const picked = new Set();
-  const order = [];
-
-  const take = (idx) => {
-    if (idx < 0 || idx >= chunks.length) return;
-    if (picked.has(idx)) return;
-    picked.add(idx);
-    order.push(idx);
-  };
-
-  // Weak-topic chunks first
-  if (weakTopics && weakTopics.length > 0) {
-    const needles = weakTopics
-      .map((t) => String(t || "").toLowerCase())
-      .filter((t) => t.length > 2);
-    for (let i = 0; i < chunks.length && picked.size < 8; i++) {
-      const hay = (chunks[i].text || "").toLowerCase();
-      if (needles.some((n) => hay.includes(n))) take(i);
-    }
-  }
-
-  // Always include first chunk (usually intro/title)
-  take(0);
-
-  // Evenly spaced samples across the document
-  const samples = Math.min(6, chunks.length);
-  for (let s = 1; s < samples - 1; s++) {
-    const idx = Math.floor((s * chunks.length) / samples);
-    take(idx);
-  }
-
-  // Always include last chunk (usually conclusion)
-  take(chunks.length - 1);
-
-  // Fill remaining budget with whatever's left, in document order
-  for (let i = 0; i < chunks.length; i++) take(i);
-
-  order.sort((a, b) => a - b);
-  let out = "";
-  for (const idx of order) {
-    const c = chunks[idx];
-    if (!c || !c.text) continue;
-    const block = c.text.trim();
-    if (out.length + block.length + 2 > budgetChars) break;
-    out += (out ? "\n\n" : "") + block;
-  }
-  return out;
+  return require("./retrieval").buildQuizContext(doc, options);
 }
 
 const service = new AIService();

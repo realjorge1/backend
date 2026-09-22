@@ -1,205 +1,188 @@
 /**
  * Embedding Service
- * Generates vector embeddings for text chunks using available AI providers.
- * Supports OpenAI, Gemini, and falls back to TF-IDF keyword vectors.
+ *
+ * Produces real vectors from a real provider, or nothing at all. There is no
+ * local fallback: the previous TF-IDF "embeddings" produced an all-zero
+ * vector for every question (a single text has no document frequencies to
+ * work with), which silently reduced every search to keyword matching while
+ * reporting itself as semantic.
+ *
+ * A document records which provider and model embedded it, and questions are
+ * embedded the same way. If that isn't possible, retrieval drops to keyword
+ * mode for that question — never to a zero vector.
  */
 
+const apiConfig = require("../config/apiConfig");
 const aiConfig = require("../config/aiConfig");
 const logger = require("../utils/logger");
 
-// Lazy-loaded provider clients
+const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+
 let _openai = null;
 let _gemini = null;
 
 function getOpenAI() {
   if (!_openai && aiConfig.openai.apiKey) {
-    try {
-      const OpenAI = require("openai");
-      _openai = new OpenAI({ apiKey: aiConfig.openai.apiKey });
-    } catch {
-      _openai = null;
-    }
+    const OpenAI = require("openai");
+    _openai = new OpenAI({ apiKey: aiConfig.openai.apiKey });
   }
   return _openai;
 }
 
 function getGemini() {
   if (!_gemini && aiConfig.gemini.apiKey) {
-    try {
-      const { GoogleGenerativeAI } = require("@google/generative-ai");
-      _gemini = new GoogleGenerativeAI(aiConfig.gemini.apiKey);
-    } catch {
-      _gemini = null;
-    }
+    const { GoogleGenerativeAI } = require("@google/generative-ai");
+    _gemini = new GoogleGenerativeAI(aiConfig.gemini.apiKey);
   }
   return _gemini;
 }
 
 /**
- * Generate embeddings for an array of text strings.
- * Tries: OpenAI → Gemini → local TF-IDF fallback.
- *
- * @param {string[]} texts - Array of text chunks to embed
- * @returns {Promise<{embeddings: number[][], provider: string}>}
+ * Which provider embeds new documents on this server.
+ * EMBEDDINGS_PROVIDER wins; otherwise the first provider with a key.
+ * @returns {{provider: string, model: string}|null}
  */
-async function generateEmbeddings(texts) {
-  if (!texts || texts.length === 0) {
-    return { embeddings: [], provider: "none" };
-  }
+function resolveProvider() {
+  const configured = apiConfig.retrieval.embeddingsProvider;
 
-  // Try OpenAI embeddings
-  const openai = getOpenAI();
-  if (openai) {
-    try {
-      return await generateOpenAIEmbeddings(openai, texts);
-    } catch (err) {
-      logger.warn("[embeddings] OpenAI embeddings failed:", err.message);
+  const available = {
+    openai: () =>
+      aiConfig.openai.apiKey
+        ? { provider: "openai", model: apiConfig.retrieval.openaiModel }
+        : null,
+    gemini: () =>
+      aiConfig.gemini.apiKey
+        ? { provider: "gemini", model: apiConfig.retrieval.geminiModel }
+        : null,
+    voyage: () =>
+      apiConfig.retrieval.voyageApiKey
+        ? { provider: "voyage", model: apiConfig.retrieval.voyageModel }
+        : null,
+  };
+
+  if (configured === "none") return null;
+  if (configured && available[configured]) {
+    const resolved = available[configured]();
+    if (!resolved) {
+      logger.warn(
+        `[embeddings] EMBEDDINGS_PROVIDER=${configured} but its API key is not set — ` +
+          "documents will use keyword retrieval",
+      );
+      return null;
     }
+    return resolved;
+  }
+  if (configured) {
+    logger.warn(`[embeddings] Unknown EMBEDDINGS_PROVIDER=${configured}; auto-detecting`);
   }
 
-  // Try Gemini embeddings
-  const gemini = getGemini();
-  if (gemini) {
-    try {
-      return await generateGeminiEmbeddings(gemini, texts);
-    } catch (err) {
-      logger.warn("[embeddings] Gemini embeddings failed:", err.message);
-    }
-  }
-
-  // Fallback: local TF-IDF-style embeddings
-  logger.info("[embeddings] Using local TF-IDF fallback");
-  return { embeddings: generateLocalEmbeddings(texts), provider: "local" };
+  return available.openai() || available.gemini() || available.voyage() || null;
 }
 
-/**
- * Generate embedding for a single text string.
- */
-async function generateSingleEmbedding(text) {
-  const result = await generateEmbeddings([text]);
-  return { embedding: result.embeddings[0], provider: result.provider };
-}
-
-// ─── OpenAI Embeddings ─────────────────────────────────────────────────────
-
-async function generateOpenAIEmbeddings(client, texts) {
-  // Process in batches of 100 (OpenAI limit is 2048)
-  const BATCH_SIZE = 100;
-  const allEmbeddings = [];
-
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch = texts.slice(i, i + BATCH_SIZE);
-    const response = await client.embeddings.create({
-      model: "text-embedding-3-small",
-      input: batch,
-    });
-    for (const item of response.data) {
-      allEmbeddings.push(item.embedding);
-    }
-  }
-
-  logger.info(
-    `[embeddings] OpenAI generated ${allEmbeddings.length} embeddings`,
+/** A vector is only usable if it exists and isn't all zeros. */
+function isUsableVector(vector) {
+  return (
+    Array.isArray(vector) &&
+    vector.length > 0 &&
+    vector.some((v) => typeof v === "number" && Number.isFinite(v) && v !== 0)
   );
-  return { embeddings: allEmbeddings, provider: "openai" };
 }
 
-// ─── Gemini Embeddings ─────────────────────────────────────────────────────
-
-async function generateGeminiEmbeddings(client, texts) {
-  const model = client.getGenerativeModel({ model: "text-embedding-004" });
-  const allEmbeddings = [];
-
-  // Gemini supports batch embedding
-  const BATCH_SIZE = 100;
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch = texts.slice(i, i + BATCH_SIZE);
-    const result = await model.batchEmbedContents({
-      requests: batch.map((text) => ({
-        content: { parts: [{ text }] },
-      })),
-    });
-    for (const emb of result.embeddings) {
-      allEmbeddings.push(emb.values);
-    }
-  }
-
-  logger.info(
-    `[embeddings] Gemini generated ${allEmbeddings.length} embeddings`,
-  );
-  return { embeddings: allEmbeddings, provider: "gemini" };
+function isRetryable(err) {
+  const status = err?.status ?? err?.response?.status;
+  if (status && RETRYABLE_STATUS.has(status)) return true;
+  return ["ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN"].includes(err?.code);
 }
 
-// ─── Local TF-IDF Fallback Embeddings ──────────────────────────────────────
-
-/**
- * Build a simple TF-IDF inspired vector for each text.
- * Not as good as neural embeddings but works offline.
- */
-function generateLocalEmbeddings(texts) {
-  // 1. Build vocabulary from all texts
-  const vocab = new Map();
-  const tokenizedTexts = texts.map((text) => tokenize(text));
-
-  // Document frequency
-  for (const tokens of tokenizedTexts) {
-    const unique = new Set(tokens);
-    for (const word of unique) {
-      vocab.set(word, (vocab.get(word) || 0) + 1);
+async function withRetry(label, fn) {
+  const maxAttempts = apiConfig.retrieval.maxRetries;
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (!isRetryable(err) || attempt === maxAttempts) break;
+      const backoffMs = 500 * 2 ** (attempt - 1);
+      logger.warn(
+        `[embeddings] ${label} attempt ${attempt}/${maxAttempts} failed; retrying in ${backoffMs}ms`,
+        { error: err.message },
+      );
+      await new Promise((r) => setTimeout(r, backoffMs));
     }
   }
+  throw lastError;
+}
 
-  // Keep top N most discriminative words (not too common, not too rare)
-  const VECTOR_DIM = 256;
-  const sorted = [...vocab.entries()]
-    .filter(([, df]) => df >= 1 && df <= texts.length * 0.9)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, VECTOR_DIM);
+// ─── Providers ───────────────────────────────────────────────────────────────
 
-  const wordToIdx = new Map(sorted.map(([word], idx) => [word, idx]));
+async function embedWithOpenAI(texts, model) {
+  const client = getOpenAI();
+  if (!client) throw new Error("OpenAI API key is not configured");
+  const response = await client.embeddings.create({ model, input: texts });
+  return response.data.map((item) => item.embedding);
+}
 
-  // 2. Generate TF-IDF vector for each text
-  const embeddings = tokenizedTexts.map((tokens) => {
-    const vec = new Array(VECTOR_DIM).fill(0);
-    const tf = new Map();
-    for (const token of tokens) {
-      tf.set(token, (tf.get(token) || 0) + 1);
-    }
-
-    for (const [word, count] of tf.entries()) {
-      const idx = wordToIdx.get(word);
-      if (idx !== undefined) {
-        const tfVal = count / tokens.length;
-        const idfVal = Math.log(texts.length / (vocab.get(word) || 1));
-        vec[idx] = tfVal * idfVal;
-      }
-    }
-
-    // L2 normalize
-    const norm = Math.sqrt(vec.reduce((sum, v) => sum + v * v, 0));
-    if (norm > 0) {
-      for (let i = 0; i < vec.length; i++) vec[i] /= norm;
-    }
-    return vec;
+async function embedWithGemini(texts, model) {
+  const client = getGemini();
+  if (!client) throw new Error("Gemini API key is not configured");
+  const embedder = client.getGenerativeModel({ model });
+  const result = await embedder.batchEmbedContents({
+    requests: texts.map((text) => ({ content: { parts: [{ text }] } })),
   });
-
-  return embeddings;
+  return result.embeddings.map((e) => e.values);
 }
 
-function tokenize(text) {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, "")
-    .split(/\s+/)
-    .filter((w) => w.length > 2);
+async function embedWithVoyage(texts, model) {
+  const apiKey = apiConfig.retrieval.voyageApiKey;
+  if (!apiKey) throw new Error("VOYAGE_API_KEY is not configured");
+  const response = await fetch("https://api.voyageai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ model, input: texts }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!response.ok) {
+    const err = new Error(`Voyage embeddings failed with ${response.status}`);
+    err.status = response.status;
+    throw err;
+  }
+  const body = await response.json();
+  return body.data.map((item) => item.embedding);
+}
+
+const PROVIDERS = {
+  openai: embedWithOpenAI,
+  gemini: embedWithGemini,
+  voyage: embedWithVoyage,
+};
+
+/**
+ * Embed texts with a specific provider and model, in batches with retries.
+ * @returns {Promise<number[][]>} one vector per input, in order
+ */
+async function embedTexts(texts, { provider, model }) {
+  const embed = PROVIDERS[provider];
+  if (!embed) throw new Error(`Unknown embeddings provider: ${provider}`);
+
+  const batchSize = apiConfig.retrieval.batchSize;
+  const vectors = [];
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
+    const batchVectors = await withRetry(`${provider} batch ${i / batchSize + 1}`, () =>
+      embed(batch, model),
+    );
+    vectors.push(...batchVectors);
+  }
+  return vectors;
 }
 
 /**
  * Embed a document's chunks during ingestion.
- *
- * The local TF-IDF fallback is deliberately not treated as an embedding
- * provider: its vectors carry no cross-document meaning, so a document it
- * "embedded" is really a keyword-retrieval document.
+ * Failure is never fatal: the document is simply stored for keyword retrieval.
  *
  * @param {Array<{chunkId: number, text: string}>} chunks
  * @returns {Promise<{chunks: Array, embedding: {provider, model, dims}|null}>}
@@ -207,30 +190,88 @@ function tokenize(text) {
 async function embedChunks(chunks) {
   if (!chunks || chunks.length === 0) return { chunks: chunks || [], embedding: null };
 
-  const { embeddings, provider } = await generateEmbeddings(chunks.map((c) => c.text));
-  if (provider === "local" || provider === "none") {
+  const resolved = resolveProvider();
+  if (!resolved) return { chunks, embedding: null };
+
+  let vectors;
+  try {
+    vectors = await embedTexts(
+      chunks.map((c) => c.text),
+      resolved,
+    );
+  } catch (err) {
+    logger.warn(
+      `[embeddings] ${resolved.provider} failed; storing document for keyword retrieval`,
+      { error: err.message },
+    );
     return { chunks, embedding: null };
   }
 
   const embedded = chunks.map((chunk, i) => ({
     ...chunk,
-    embedding: Array.isArray(embeddings[i]) && embeddings[i].length > 0 ? embeddings[i] : null,
+    embedding: isUsableVector(vectors[i]) ? vectors[i] : null,
   }));
+
   const dims = embedded.find((c) => c.embedding)?.embedding?.length || 0;
-  if (!dims) return { chunks, embedding: null };
+  if (!dims) {
+    logger.warn("[embeddings] Provider returned no usable vectors; keyword retrieval");
+    return { chunks, embedding: null };
+  }
 
-  const model =
-    provider === "openai"
-      ? "text-embedding-3-small"
-      : provider === "gemini"
-        ? "text-embedding-004"
-        : provider;
+  logger.info(
+    `[embeddings] Embedded ${embedded.filter((c) => c.embedding).length}/${chunks.length} ` +
+      `chunks via ${resolved.provider}/${resolved.model} (${dims} dims)`,
+  );
 
-  return { chunks: embedded, embedding: { provider, model, dims } };
+  return {
+    chunks: embedded,
+    embedding: { provider: resolved.provider, model: resolved.model, dims },
+  };
+}
+
+/**
+ * Embed a question with the provider and model the document was embedded
+ * with. Returns null — never a zero vector — when that can't be done, which
+ * puts this question into keyword mode.
+ *
+ * @param {string} text
+ * @param {{provider: string, model: string, dims: number}} docEmbedding
+ * @returns {Promise<number[]|null>}
+ */
+async function embedQuery(text, docEmbedding) {
+  if (!docEmbedding?.provider || !PROVIDERS[docEmbedding.provider]) return null;
+
+  const model = docEmbedding.model || resolveProvider()?.model;
+  if (!model) return null;
+
+  let vectors;
+  try {
+    vectors = await embedTexts([text], { provider: docEmbedding.provider, model });
+  } catch (err) {
+    logger.warn(`[embeddings] Query embedding failed via ${docEmbedding.provider}`, {
+      error: err.message,
+    });
+    return null;
+  }
+
+  const vector = vectors[0];
+  if (!isUsableVector(vector)) return null;
+
+  // A model swap behind the same name would silently produce nonsense scores.
+  if (docEmbedding.dims && vector.length !== docEmbedding.dims) {
+    logger.warn(
+      `[embeddings] Dimension mismatch (document ${docEmbedding.dims}, query ${vector.length}) — keyword mode`,
+    );
+    return null;
+  }
+
+  return vector;
 }
 
 module.exports = {
-  generateEmbeddings,
-  generateSingleEmbedding,
+  resolveProvider,
+  embedTexts,
   embedChunks,
+  embedQuery,
+  isUsableVector,
 };
