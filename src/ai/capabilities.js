@@ -48,6 +48,16 @@ function getCapabilities() {
       require("../services/aiService").supportsTask("narrative-arc"),
     ),
     markdown: safe(() => require("../services/aiService").MARKDOWN_OUTPUT === true),
+    // True only when the route is really deployed here AND a provider is
+    // really configured for it. With no provider key this is false and the app
+    // keeps the feature invisible, which is the correct quiet outcome.
+    proofread: safe(
+      () =>
+        typeof require("../services/proofread").proofread === "function" &&
+        typeof require("../services/proofreadRequest").parseProofreadRequest ===
+          "function" &&
+        require("../services/proofread").isConfigured(),
+    ),
     authMode: apiConfig.authMode,
   };
 }

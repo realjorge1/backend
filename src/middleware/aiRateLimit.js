@@ -47,7 +47,18 @@ function limitHandler(scope) {
   };
 }
 
-function build(scope, { windowMs, limit, keyGenerator }) {
+/**
+ * /api/ai/proofread runs on a typing debounce and would otherwise spend a
+ * user's whole shared AI budget within a minute, 429-ing the document tasks
+ * they ran alongside it. It carries its own, tighter buckets instead — see
+ * middleware/proofreadRateLimit.js — so the shared per-user buckets skip it.
+ * The per-IP bucket and the daily token budget still apply to it.
+ */
+function isProofread(req) {
+  return String(req.originalUrl || "").split("?")[0].replace(/\/+$/, "") === "/api/ai/proofread";
+}
+
+function build(scope, { windowMs, limit, keyGenerator, skip }) {
   return rateLimit({
     windowMs,
     limit,
@@ -55,7 +66,7 @@ function build(scope, { windowMs, limit, keyGenerator }) {
     standardHeaders: "draft-7",
     legacyHeaders: false,
     handler: limitHandler(scope),
-    skip: () => !apiConfig.rateLimit.enabled,
+    skip: (req, res) => !apiConfig.rateLimit.enabled || Boolean(skip && skip(req, res)),
     // The AI router answers capability discovery without auth; don't spend
     // budget on it.
     skipSuccessfulRequests: false,
@@ -66,12 +77,14 @@ const perUserMinute = build("user/min", {
   windowMs: 60 * 1000,
   limit: apiConfig.rateLimit.aiPerMin,
   keyGenerator: userOrIpKey,
+  skip: isProofread,
 });
 
 const perUserDay = build("user/day", {
   windowMs: 24 * 60 * 60 * 1000,
   limit: apiConfig.rateLimit.aiPerDay,
   keyGenerator: userOrIpKey,
+  skip: isProofread,
 });
 
 const perIpMinute = build("ip/min", {

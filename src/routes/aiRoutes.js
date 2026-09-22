@@ -22,6 +22,9 @@ const apiConfig = require("../config/apiConfig");
 const { getCapabilities } = require("../ai/capabilities");
 const { authStatsHandler } = require("../middleware/aiAuth");
 const { requireAdmin } = require("../middleware/requireAdmin");
+const { shortHash } = require("../middleware/requestContext");
+const proofreadService = require("../services/proofread");
+const { parseProofreadRequest } = require("../services/proofreadRequest");
 
 // Initialize providers eagerly so startup logs show status
 try {
@@ -755,6 +758,114 @@ router.post("/narrative-arc", async (req, res) => {
     res.json(taskResponse(result));
   } catch (err) {
     sendError(res, "narrative-arc", err);
+  }
+});
+
+// ============================================
+// POST /api/ai/proofread — spelling / grammar / punctuation / clarity pass
+//
+// The highest-frequency AI route: the app calls it on a typing debounce, so it
+// carries its own limiters (mounted in ai/mountAiApi.js), its own per-block
+// cache and a 15-second budget rather than the 180-second document-task one.
+//
+// The response deliberately contains no character offsets. Every suggestion is
+// verified as an exact substring of the block it belongs to, and `occurrence`
+// and `before` are computed server-side from that verified position — never
+// passed through from the model.
+// ============================================
+router.post("/proofread", async (req, res) => {
+  const startedAt = Date.now();
+  let parsed;
+
+  try {
+    parsed = parseProofreadRequest(req.body);
+  } catch (err) {
+    // A validation failure must never reach the model.
+    logger.warn("proofread_bad_request", {
+      requestId: req.requestId,
+      reason: err.message,
+    });
+    return res.status(400).json({
+      success: false,
+      code: "BAD_REQUEST",
+      error: err.message,
+      requestId: req.requestId,
+    });
+  }
+
+  // With no provider key this instance genuinely cannot serve the request, so
+  // 503 (and the app's failover to the other server) is the honest answer.
+  // capabilities.proofread is already false in this state, so a client that
+  // reads the status endpoint never gets here.
+  if (!proofreadService.isConfigured()) {
+    logger.error("proofread_no_provider", { requestId: req.requestId });
+    return res.status(503).json({
+      success: false,
+      code: "UNAVAILABLE",
+      error: "Proofreading is temporarily unavailable. Please try again.",
+      requestId: req.requestId,
+    });
+  }
+
+  try {
+    const { blocks, stats } = await proofreadService.proofread({
+      blocks: parsed.blocks,
+      language: parsed.language,
+      dialect: parsed.dialect,
+      goals: parsed.goals,
+      requestId: req.requestId,
+    });
+
+    // One structured line per request. Block text is user document content and
+    // never appears here — only counts, lengths, hashes and timings.
+    logger.info("proofread", {
+      requestId: req.requestId,
+      blockCount: parsed.blocks.length,
+      totalChars: parsed.totalChars,
+      goals: parsed.goals,
+      language: parsed.language,
+      dialect: parsed.dialect,
+      cacheHits: stats.cacheHits,
+      cacheMisses: stats.cacheMisses,
+      model: stats.model,
+      provider: stats.provider,
+      modelLatencyMs: stats.modelLatencyMs,
+      totalLatencyMs: Date.now() - startedAt,
+      proposed: stats.proposed,
+      dropped: stats.drops,
+      droppedTotal: Object.values(stats.drops).reduce((a, b) => a + b, 0),
+      coercedTypes: stats.coercedTypes,
+      returned: stats.returned,
+      retries: stats.retries,
+      partial: stats.partial,
+      promptTokens: stats.usage?.promptTokens,
+      completionTokens: stats.usage?.completionTokens,
+      totalTokens: stats.usage?.totalTokens,
+      user: shortHash(req.userHash),
+      outcome: "ok",
+    });
+
+    // Feed the shared per-user token accounting the same way the task routes
+    // do, so a typing burst counts against DAILY_TOKEN_BUDGET_PER_USER.
+    if (stats.usage?.totalTokens) res.locals.tokensUsed = stats.usage.totalTokens;
+    if (stats.provider) res.locals.provider = stats.provider;
+
+    return res.json({
+      success: true,
+      task: "proofread",
+      data: { blocks },
+    });
+  } catch (err) {
+    logger.warn("proofread", {
+      requestId: req.requestId,
+      blockCount: parsed.blocks.length,
+      totalChars: parsed.totalChars,
+      totalLatencyMs: Date.now() - startedAt,
+      user: shortHash(req.userHash),
+      outcome: "error",
+      code: err.code || "AI_PROVIDER_ERROR",
+    });
+    return sendError(res, "proofread", err);
   }
 });
 

@@ -84,6 +84,36 @@ const apiConfig = {
     translateMaxOutputChars: int(process.env.TRANSLATE_MAX_OUTPUT_CHARS, 200000),
   },
 
+  // ── Proofread ─────────────────────────────────────────────────────────────
+  // The app calls POST /api/ai/proofread on a typing debounce, so this is by
+  // far the highest-frequency AI route. It gets its own tighter limits, its
+  // own concurrency cap and its own cache rather than sharing the general AI
+  // budget, so a burst of typing can't starve the document tasks.
+  proofread: {
+    // Empty means "use whatever model the active provider is configured with",
+    // which is already the fast/cheap tier for all three providers.
+    model: process.env.PROOFREAD_MODEL || "",
+    maxTokens: int(process.env.PROOFREAD_MAX_TOKENS, 3000),
+
+    // Whole-request budget (P5.1: answer within 15s; the app allows 20s).
+    budgetMs: int(process.env.PROOFREAD_BUDGET_MS, 15000),
+    modelTimeoutMs: int(process.env.PROOFREAD_MODEL_TIMEOUT_MS, 11000),
+    // Don't start a model attempt that can't plausibly finish in what's left.
+    minAttemptMs: int(process.env.PROOFREAD_MIN_ATTEMPT_MS, 2500),
+
+    // In-process only: the free tier has no disk and no Redis.
+    cacheMaxBlocks: int(process.env.PROOFREAD_CACHE_MAX_BLOCKS, 500),
+    cacheTtlMs: int(process.env.PROOFREAD_CACHE_TTL_MS, 24 * 60 * 60 * 1000),
+
+    perMin: int(process.env.PROOFREAD_PER_MIN, 30),
+    perHour: int(process.env.PROOFREAD_PER_HOUR, 400),
+    charsPerMin: int(process.env.PROOFREAD_CHARS_PER_MIN, 120000),
+    maxConcurrent: int(process.env.PROOFREAD_MAX_CONCURRENT, 4),
+    // How long a request may wait for a concurrency slot before we tell the
+    // app to back off instead of burning its 20-second client budget.
+    queueWaitMs: int(process.env.PROOFREAD_QUEUE_WAIT_MS, 2000),
+  },
+
   // ── Streaming ─────────────────────────────────────────────────────────────
   streaming: {
     enabled: process.env.STREAMING_ENABLED !== "false",
