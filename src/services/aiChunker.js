@@ -41,9 +41,28 @@ const MAP_CONCURRENCY = parseInt(process.env.AI_MAP_CONCURRENCY, 10) || 2;
  * @returns {string[]}
  */
 function chunkText(text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
-  if (!text || text.length <= chunkSize) return [text || ""];
+  return chunkTextWithInfo(text, chunkSize, overlap).chunks;
+}
+
+/**
+ * Like chunkText, but also reports how much of the document actually made it
+ * into the chunks — MAX_CHUNKS can cut a very long document short, and the
+ * caller has to be able to say so.
+ *
+ * @returns {{chunks: string[], truncated: boolean, processedChars: number}}
+ */
+function chunkTextWithInfo(text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
+  if (!text || text.length <= chunkSize) {
+    return {
+      chunks: [text || ""],
+      truncated: false,
+      processedChars: (text || "").length,
+    };
+  }
 
   const chunks = [];
+  let truncated = false;
+  let processedChars = text.length;
   let pos = 0;
   while (pos < text.length) {
     const end = Math.min(pos + chunkSize, text.length);
@@ -73,14 +92,55 @@ function chunkText(text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
       // Last chunk takes everything still remaining so no content is lost.
       const last = text.slice(pos);
       if (last && last !== chunks[chunks.length - 1]) {
-        chunks[chunks.length - 1] =
-          chunks[chunks.length - 1] +
-          (last.length > chunkSize ? "\n\n[…document continues; truncated for length…]" : "\n\n" + last);
+        if (last.length > chunkSize) {
+          chunks[chunks.length - 1] =
+            chunks[chunks.length - 1] + "\n\n[…document continues; truncated for length…]";
+          truncated = true;
+          processedChars = pos;
+        } else {
+          chunks[chunks.length - 1] = chunks[chunks.length - 1] + "\n\n" + last;
+        }
       }
       break;
     }
   }
-  return chunks;
+  return { chunks, truncated, processedChars };
+}
+
+/**
+ * Split text for translation: no overlap (it would duplicate sentences in the
+ * output) and no chunk cap (the output limit is what bounds the work).
+ *
+ * @returns {string[]}
+ */
+function splitForTranslation(text, chunkChars) {
+  const source = String(text || "");
+  if (source.length <= chunkChars) return source ? [source] : [];
+
+  const parts = [];
+  let pos = 0;
+  while (pos < source.length) {
+    const end = Math.min(pos + chunkChars, source.length);
+    let sliceEnd = end;
+
+    if (end < source.length) {
+      // Prefer a paragraph break, then a sentence end, then any line break.
+      const window = source.slice(Math.max(pos, end - 2000), end);
+      const candidates = [
+        window.lastIndexOf("\n\n"),
+        window.lastIndexOf(". "),
+        window.lastIndexOf("\n"),
+      ].filter((i) => i > 0);
+      if (candidates.length > 0) {
+        sliceEnd = Math.max(pos, end - 2000) + Math.max(...candidates) + 1;
+      }
+    }
+    if (sliceEnd <= pos) sliceEnd = end;
+
+    parts.push(source.slice(pos, sliceEnd));
+    pos = sliceEnd;
+  }
+  return parts;
 }
 
 /**
@@ -125,8 +185,13 @@ async function mapReduceLong({
   chatOptions = {},
   parseChunk = (c) => c,
   threshold = CHUNK_THRESHOLD,
+  // What the caller already knows about the input: its true size before any
+  // cap, and whether it was cut before reaching us.
+  coverageInput = {},
 }) {
   const safeText = String(text || "");
+  const totalChars = coverageInput.totalChars ?? safeText.length;
+  const inputTruncated = Boolean(coverageInput.truncated);
 
   if (safeText.length <= threshold) {
     // Small enough — run as a single call so the result quality matches the
@@ -140,10 +205,21 @@ async function mapReduceLong({
       chunkCount: 1,
       parts: [parseChunk(result.content, 0)],
       usage: result.usage,
+      coverage: {
+        totalChars,
+        processedChars: safeText.length,
+        chunked: false,
+        chunkCount: 1,
+        truncated: inputTruncated,
+      },
     };
   }
 
-  const chunks = chunkText(safeText);
+  const {
+    chunks,
+    truncated: chunkTruncated,
+    processedChars,
+  } = chunkTextWithInfo(safeText);
   logger.info(
     `[aiChunker] map-reduce over ${chunks.length} chunks ` +
       `(${safeText.length} chars, threshold=${threshold})`,
@@ -178,13 +254,136 @@ async function mapReduceLong({
     chunkCount: chunks.length,
     parts: goodParts.map((p) => p.parsed),
     usage: reduced.usage,
+    coverage: {
+      totalChars,
+      processedChars: Math.min(processedChars, safeText.length),
+      chunked: true,
+      chunkCount: chunks.length,
+      truncated: inputTruncated || chunkTruncated,
+    },
+  };
+}
+
+/**
+ * Translate a long document part by part.
+ *
+ * Translation can't map-reduce: the output is as long as the input, so a
+ * 60k-char chunk could never fit in one reply. Parts are translated in order,
+ * two at a time, and joined without a merge call — a merge would rewrite the
+ * translation.
+ *
+ * @param {object} opts
+ *   text            — full source text
+ *   buildMessages(chunk, index, total) — messages for one part
+ *   chatOptions     — passed to aiProvider.chat
+ *   chunkChars      — target size of one part
+ *   maxOutputChars  — stop cleanly at a part boundary once exceeded
+ * @returns {Promise<{provider, content, chunked, chunkCount, usage, coverage}>}
+ */
+async function translateLong({
+  text,
+  buildMessages,
+  chatOptions = {},
+  chunkChars,
+  maxOutputChars,
+  concurrency = MAP_CONCURRENCY,
+  coverageInput = {},
+}) {
+  const safeText = String(text || "");
+  const totalChars = coverageInput.totalChars ?? safeText.length;
+  const parts = splitForTranslation(safeText, chunkChars);
+
+  const outputs = [];
+  let processedChars = 0;
+  let truncated = Boolean(coverageInput.truncated);
+  let provider;
+  const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+  const addUsage = (u) => {
+    if (!u) return;
+    usage.promptTokens += u.promptTokens || 0;
+    usage.completionTokens += u.completionTokens || 0;
+    usage.totalTokens += u.totalTokens || 0;
+  };
+
+  /**
+   * Translate one part. A reply cut off at max_tokens is retried once as two
+   * halves, which is the only reliable way to fit it.
+   */
+  const translatePart = async (chunk, index) => {
+    const result = await aiProvider.chat(buildMessages(chunk, index, parts.length), chatOptions);
+    addUsage(result.usage);
+    provider = provider || result.provider;
+
+    if (result.stopReason !== "max_tokens") {
+      return { text: result.content, complete: true };
+    }
+
+    logger.warn(
+      `[translate] part ${index + 1}/${parts.length} hit the output limit — splitting and retrying`,
+    );
+
+    const halves = splitForTranslation(chunk, Math.ceil(chunk.length / 2));
+    const translatedHalves = [];
+    let complete = true;
+    for (let h = 0; h < halves.length; h++) {
+      const retry = await aiProvider.chat(
+        buildMessages(halves[h], index, parts.length),
+        chatOptions,
+      );
+      addUsage(retry.usage);
+      translatedHalves.push(retry.content);
+      if (retry.stopReason === "max_tokens") complete = false;
+    }
+    return { text: translatedHalves.join("\n\n"), complete };
+  };
+
+  for (let start = 0; start < parts.length; start += concurrency) {
+    const batch = parts.slice(start, start + concurrency);
+    const results = await Promise.all(
+      batch.map((chunk, offset) => translatePart(chunk, start + offset)),
+    );
+
+    for (let i = 0; i < results.length; i++) {
+      outputs.push(results[i].text);
+      processedChars += batch[i].length;
+      if (!results[i].complete) truncated = true;
+    }
+
+    const producedChars = outputs.reduce((n, part) => n + part.length, 0);
+    if (producedChars >= maxOutputChars && start + concurrency < parts.length) {
+      logger.warn(
+        `[translate] stopping at part ${outputs.length}/${parts.length}: ` +
+          `output limit of ${maxOutputChars} chars reached`,
+      );
+      truncated = true;
+      break;
+    }
+  }
+
+  return {
+    provider,
+    content: outputs.join("\n\n"),
+    chunked: parts.length > 1,
+    chunkCount: parts.length,
+    usage: usage.totalTokens > 0 ? usage : undefined,
+    coverage: {
+      totalChars,
+      processedChars,
+      chunked: parts.length > 1,
+      chunkCount: parts.length,
+      truncated,
+    },
   };
 }
 
 module.exports = {
   chunkText,
+  chunkTextWithInfo,
+  splitForTranslation,
   pMap,
   mapReduceLong,
+  translateLong,
   CHUNK_SIZE,
   CHUNK_THRESHOLD,
   CHUNK_OVERLAP,

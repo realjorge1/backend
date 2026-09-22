@@ -67,16 +67,79 @@ class GeminiProvider {
 
     return {
       content: text,
-      usage: response.usageMetadata
-        ? {
-            promptTokens: response.usageMetadata.promptTokenCount,
-            completionTokens: response.usageMetadata.candidatesTokenCount,
-            totalTokens: response.usageMetadata.totalTokenCount,
-          }
-        : undefined,
+      usage: usageFrom(response.usageMetadata),
+      stopReason: normalizeStopReason(response.candidates?.[0]?.finishReason),
       provider: this.name,
     };
   }
+
+  /**
+   * Stream a reply, forwarding text as it arrives.
+   * @param {object} handlers { signal, onText }
+   */
+  async chatStream(messages, options = {}, { signal, onText } = {}) {
+    const systemMsg = messages.find((m) => m.role === "system");
+    const nonSystemMessages = messages.filter((m) => m.role !== "system");
+
+    if (nonSystemMessages.length === 0) {
+      throw new Error("At least one non-system message is required");
+    }
+
+    const model = this.genAI.getGenerativeModel({
+      model: options.model || this.modelName,
+      systemInstruction: systemMsg ? systemMsg.content : undefined,
+    });
+
+    const generationConfig = {
+      temperature: options.temperature ?? 0.7,
+      maxOutputTokens: options.maxTokens ?? 4000,
+    };
+
+    const result = await model.generateContentStream({
+      contents: nonSystemMessages.map((msg) => ({
+        role: msg.role === "assistant" ? "model" : "user",
+        parts: [{ text: msg.content }],
+      })),
+      generationConfig,
+    });
+
+    let content = "";
+    for await (const chunk of result.stream) {
+      if (signal?.aborted) {
+        const err = new Error("Request aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+      const text = typeof chunk.text === "function" ? chunk.text() : "";
+      if (text) {
+        content += text;
+        if (onText) onText(text);
+      }
+    }
+
+    const response = await result.response;
+    return {
+      content,
+      usage: usageFrom(response.usageMetadata),
+      stopReason: normalizeStopReason(response.candidates?.[0]?.finishReason),
+      provider: this.name,
+    };
+  }
+}
+
+function usageFrom(usageMetadata) {
+  if (!usageMetadata) return undefined;
+  return {
+    promptTokens: usageMetadata.promptTokenCount,
+    completionTokens: usageMetadata.candidatesTokenCount,
+    totalTokens: usageMetadata.totalTokenCount,
+  };
+}
+
+/** Gemini reports MAX_TOKENS in upper case. */
+function normalizeStopReason(reason) {
+  if (reason === "MAX_TOKENS") return "max_tokens";
+  return reason ? String(reason).toLowerCase() : "end_turn";
 }
 
 module.exports = GeminiProvider;

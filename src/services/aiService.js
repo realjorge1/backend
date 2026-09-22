@@ -7,9 +7,57 @@
 const aiProvider = require("./aiProvider");
 const documentProcessor = require("./documentProcessor");
 const aiConfig = require("../config/aiConfig");
+const apiConfig = require("../config/apiConfig");
 const logger = require("../utils/logger");
 const { enrichHighlights, locateSnippet, normalize } = require("./sourceMapper");
-const { mapReduceLong, CHUNK_THRESHOLD } = require("./aiChunker");
+const { mapReduceLong, translateLong, CHUNK_THRESHOLD } = require("./aiChunker");
+
+// Tasks that can run over a whole stored document (contract C5).
+const DOC_ID_TASKS = new Set([
+  "summarize",
+  "translate",
+  "analyze",
+  "tasks",
+  "extract-tasks",
+  "highlight",
+  "explain",
+  "quiz",
+  "devils-advocate",
+  "narrative-arc",
+]);
+
+// What `data.format` reports per task.
+const TASK_FORMATS = {
+  summarize: "text",
+  translate: "text",
+  chat: "text",
+  explain: "text",
+  analyze: "json",
+  tasks: "json",
+  "extract-tasks": "json",
+  highlight: "json",
+  classify: "json",
+  quiz: "json",
+  "fill-form": "json",
+  "generate-document": "text",
+  "highlight-summary": "json",
+  "devils-advocate": "json",
+  "narrative-arc": "json",
+};
+
+/**
+ * The user's extra request, kept clearly separate from document content so
+ * the model can't confuse one for the other.
+ */
+function instructionBlock(instruction) {
+  const trimmed = String(instruction || "").trim();
+  if (!trimmed) return "";
+  return (
+    `\n\n--- ADDITIONAL REQUEST FROM THE USER ---\n` +
+    `${trimmed}\n` +
+    `--- END ADDITIONAL REQUEST ---\n`
+  );
+}
 
 // Categories tuned per detected document type. The model is free to use its
 // own labels if none of these apply — we never coerce the output.
@@ -405,27 +453,61 @@ class AIService {
 
     const startTime = Date.now();
 
+    // With a docId, the stored document replaces `text` as the content to
+    // work on, and the whole document is processed rather than whatever
+    // excerpt the client had room to send.
+    let coverageInput;
+    let resolvedText = text;
+    if (params.docId && DOC_ID_TASKS.has(task)) {
+      const resolved = await this.resolveDocumentInput({
+        docId: params.docId,
+        userHash: params.userHash,
+      });
+      resolvedText = resolved.text;
+      coverageInput = { totalChars: resolved.totalChars, truncated: resolved.truncated };
+    }
+
+    const taskParams = {
+      ...params,
+      text: resolvedText,
+      coverageInput,
+      instruction: params.instruction,
+    };
+
     try {
       let result;
 
       switch (task) {
         case "summarize":
           result = await this._summarize(
-            text,
+            taskParams.text,
             file,
             options,
             params.summaryMode,
+            taskParams,
           );
           break;
         case "translate":
-          result = await this._translate(text, file, targetLanguage, options);
+          result = await this._translate(
+            taskParams.text,
+            file,
+            targetLanguage,
+            options,
+            taskParams,
+          );
           break;
         case "analyze":
-          result = await this._analyze(text, file, analysisType, options);
+          result = await this._analyze(
+            taskParams.text,
+            file,
+            analysisType,
+            options,
+            taskParams,
+          );
           break;
         case "tasks":
         case "extract-tasks":
-          result = await this._extractTasks(text, file, options);
+          result = await this._extractTasks(taskParams.text, file, options, taskParams);
           break;
         case "fill-form":
           result = await this._fillForm(
@@ -442,10 +524,16 @@ class AIService {
           result = await this._classify(text, file, filename, options);
           break;
         case "highlight":
-          result = await this._highlight(text, file, options);
+          result = await this._highlight(taskParams.text, file, options, taskParams);
           break;
         case "explain":
-          result = await this._explain(text, explainMode, options, params.explainDepth);
+          result = await this._explain(
+            taskParams.text,
+            explainMode,
+            options,
+            params.explainDepth,
+            taskParams,
+          );
           break;
         case "generate-document":
           result = await this._generateDocument(
@@ -460,7 +548,7 @@ class AIService {
           break;
         case "quiz":
           result = await this._quiz(
-            text,
+            taskParams.text,
             file,
             questionType || quizType,
             quizCount,
@@ -468,6 +556,7 @@ class AIService {
             quizDifficulty,
             weakTopics,
             retrievedContext,
+            taskParams,
           );
           break;
         default: {
@@ -482,7 +571,7 @@ class AIService {
         `AI task "${task}" completed in ${elapsed}ms via ${result.provider}`,
       );
 
-      return this._formatSuccess(task, result);
+      return this._formatSuccess(task, result, coverageInput);
     } catch (err) {
       const elapsed = Date.now() - startTime;
       logger.error(`AI task "${task}" failed after ${elapsed}ms`, {
@@ -495,16 +584,18 @@ class AIService {
 
   // ─── Individual task implementations ───────────────────────────
 
-  async _summarize(text, file, options, summaryMode) {
+  async _summarize(text, file, options, summaryMode, taskParams = {}) {
     const docText = await this._resolveDocumentText(text, file);
     const { text: safeText } = documentProcessor.truncate(
       docText,
       aiConfig.maxDocumentLength,
     );
+    const extra = instructionBlock(taskParams.instruction);
 
     return mapReduceLong({
       text: safeText,
       chatOptions: options,
+      coverageInput: taskParams.coverageInput,
       buildMapMessages: (chunk, i) => [
         { role: "system", content: PROMPT_TEMPLATES.summarize.system },
         {
@@ -513,7 +604,8 @@ class AIService {
             `You are summarizing PART ${i + 1} of a longer document. ` +
             `Produce a partial summary covering ONLY this part — do not invent ` +
             `content from sections you cannot see.\n\n` +
-            PROMPT_TEMPLATES.summarize.userPrompt(chunk, summaryMode),
+            PROMPT_TEMPLATES.summarize.userPrompt(chunk, summaryMode) +
+            extra,
         },
       ],
       buildReduceMessages: (parts) => [
@@ -524,13 +616,14 @@ class AIService {
             `Below are partial summaries of consecutive sections of a long document. ` +
             `Merge them into ONE final ${summaryMode || "detailed"} summary that reads as a single coherent piece. ` +
             `Remove redundancy. Preserve every distinct fact, finding, or recommendation.\n\n` +
-            parts.map((p, i) => `--- Part ${i + 1} ---\n${p}`).join("\n\n"),
+            parts.map((p, i) => `--- Part ${i + 1} ---\n${p}`).join("\n\n") +
+            extra,
         },
       ],
     });
   }
 
-  async _translate(text, file, targetLanguage, options) {
+  async _translate(text, file, targetLanguage, options, taskParams = {}) {
     if (!targetLanguage) {
       const err = new Error("Target language is required for translation");
       err.code = "VALIDATION_ERROR";
@@ -542,33 +635,77 @@ class AIService {
       docText,
       aiConfig.maxDocumentLength,
     );
+    const extra = instructionBlock(taskParams.instruction);
 
     const systemContent =
       typeof PROMPT_TEMPLATES.translate.system === "function"
         ? PROMPT_TEMPLATES.translate.system(targetLanguage)
         : PROMPT_TEMPLATES.translate.system;
 
+    // A translation is as long as its source, so one call can only carry
+    // about as much text as maxTokens allows. Long documents are translated
+    // part by part, in order, and joined — never merged by another model
+    // call, which would rewrite the translation.
+    const { translateChunkChars, translateMaxOutputChars } = apiConfig.tasks;
+    if (safeText.length > translateChunkChars) {
+      return translateLong({
+        text: safeText,
+        chatOptions: options,
+        chunkChars: translateChunkChars,
+        maxOutputChars: translateMaxOutputChars,
+        coverageInput: taskParams.coverageInput,
+        buildMessages: (chunk, index, total) => [
+          { role: "system", content: systemContent },
+          {
+            role: "user",
+            content:
+              (total > 1
+                ? `This is part ${index + 1} of ${total} of one document. ` +
+                  `Translate only this part. Do not add an introduction, a summary, ` +
+                  `or any note about the split.\n\n`
+                : "") +
+              PROMPT_TEMPLATES.translate.userPrompt(chunk) +
+              extra,
+          },
+        ],
+      });
+    }
+
     const messages = [
       { role: "system", content: systemContent },
       {
         role: "user",
-        content: PROMPT_TEMPLATES.translate.userPrompt(safeText),
+        content: PROMPT_TEMPLATES.translate.userPrompt(safeText) + extra,
       },
     ];
 
-    return aiProvider.chat(messages, options);
+    const result = await aiProvider.chat(messages, options);
+    return {
+      ...result,
+      coverage: {
+        totalChars: taskParams.coverageInput?.totalChars ?? safeText.length,
+        processedChars: safeText.length,
+        chunked: false,
+        chunkCount: 1,
+        truncated:
+          Boolean(taskParams.coverageInput?.truncated) ||
+          result.stopReason === "max_tokens",
+      },
+    };
   }
 
-  async _analyze(text, file, analysisType, options) {
+  async _analyze(text, file, analysisType, options, taskParams = {}) {
     const docText = await this._resolveDocumentText(text, file);
     const { text: safeText } = documentProcessor.truncate(
       docText,
       aiConfig.maxDocumentLength,
     );
+    const extra = instructionBlock(taskParams.instruction);
 
     const result = await mapReduceLong({
       text: safeText,
       chatOptions: options,
+      coverageInput: taskParams.coverageInput,
       buildMapMessages: (chunk, i) => [
         { role: "system", content: PROMPT_TEMPLATES.analyze.system },
         {
@@ -576,7 +713,8 @@ class AIService {
           content:
             `Analyze PART ${i + 1} of a longer document. Focus only on this part. ` +
             `Return the same JSON shape requested below.\n\n` +
-            PROMPT_TEMPLATES.analyze.userPrompt(chunk, analysisType),
+            PROMPT_TEMPLATES.analyze.userPrompt(chunk, analysisType) +
+            extra,
         },
       ],
       buildReduceMessages: (parts) => [
@@ -606,16 +744,18 @@ class AIService {
     return result;
   }
 
-  async _extractTasks(text, file, options) {
+  async _extractTasks(text, file, options, taskParams = {}) {
     const docText = await this._resolveDocumentText(text, file);
     const { text: safeText } = documentProcessor.truncate(
       docText,
       aiConfig.maxDocumentLength,
     );
+    const extra = instructionBlock(taskParams.instruction);
 
     const result = await mapReduceLong({
       text: safeText,
       chatOptions: options,
+      coverageInput: taskParams.coverageInput,
       buildMapMessages: (chunk, i) => [
         { role: "system", content: PROMPT_TEMPLATES.tasks.system },
         {
@@ -623,7 +763,8 @@ class AIService {
           content:
             `Extract action items from PART ${i + 1} of a longer document only. ` +
             `Do not invent tasks not in this part.\n\n` +
-            PROMPT_TEMPLATES.tasks.userPrompt(chunk),
+            PROMPT_TEMPLATES.tasks.userPrompt(chunk) +
+            extra,
         },
       ],
       buildReduceMessages: (parts) => [
@@ -802,12 +943,13 @@ class AIService {
     return result;
   }
 
-  async _highlight(text, file, options) {
+  async _highlight(text, file, options, taskParams = {}) {
     const docText = await this._resolveDocumentText(text, file);
     const { text: safeText } = documentProcessor.truncate(
       docText,
       aiConfig.maxDocumentLength,
     );
+    const extra = instructionBlock(taskParams.instruction);
 
     // ── Step 1: Quick document classification to tailor categories ──────────
     let documentType = "other";
@@ -826,6 +968,7 @@ class AIService {
     const result = await mapReduceLong({
       text: safeText,
       chatOptions: options,
+      coverageInput: taskParams.coverageInput,
       buildMapMessages: (chunk, i) => [
         { role: "system", content: PROMPT_TEMPLATES.highlight.system },
         {
@@ -833,7 +976,8 @@ class AIService {
           content:
             `Extract highlights from PART ${i + 1} of a longer document. ` +
             `Only quote text that appears in this part — NEVER fabricate.\n\n` +
-            PROMPT_TEMPLATES.highlight.userPrompt(chunk, documentType, allowedCategories),
+            PROMPT_TEMPLATES.highlight.userPrompt(chunk, documentType, allowedCategories) +
+            extra,
         },
       ],
       // For the reduce step, the LLM merges per-chunk highlight arrays into
@@ -962,7 +1106,7 @@ class AIService {
     return result;
   }
 
-  async _explain(text, mode, options, depth) {
+  async _explain(text, mode, options, depth, taskParams = {}) {
     if (!text) {
       const err = new Error("Text is required for explanation");
       err.code = "VALIDATION_ERROR";
@@ -973,6 +1117,7 @@ class AIService {
       text,
       aiConfig.maxDocumentLength,
     );
+    const extra = instructionBlock(taskParams.instruction);
 
     const systemContent =
       typeof PROMPT_TEMPLATES.explain.system === "function"
@@ -982,13 +1127,15 @@ class AIService {
     return mapReduceLong({
       text: safeText,
       chatOptions: options,
+      coverageInput: taskParams.coverageInput,
       buildMapMessages: (chunk, i) => [
         { role: "system", content: systemContent },
         {
           role: "user",
           content:
             `Explain PART ${i + 1} of a longer text in the same style.\n\n` +
-            PROMPT_TEMPLATES.explain.userPrompt(chunk, mode, depth),
+            PROMPT_TEMPLATES.explain.userPrompt(chunk, mode, depth) +
+            extra,
         },
       ],
       buildReduceMessages: (parts) => [
@@ -1004,7 +1151,17 @@ class AIService {
     });
   }
 
-  async _quiz(text, file, questionType, count, options, difficulty, weakTopics, retrievedContext) {
+  async _quiz(
+    text,
+    file,
+    questionType,
+    count,
+    options,
+    difficulty,
+    weakTopics,
+    retrievedContext,
+    taskParams = {},
+  ) {
     // Retrieved context (from stored docId chunks) takes precedence; otherwise use raw text.
     const docText = retrievedContext && retrievedContext.length > 0
       ? retrievedContext
@@ -1044,7 +1201,14 @@ class AIService {
       { role: "system", content: PROMPT_TEMPLATES.quiz.system },
       {
         role: "user",
-        content: PROMPT_TEMPLATES.quiz.userPrompt(safeText, questionType, count, difficulty, weakTopics),
+        content:
+          PROMPT_TEMPLATES.quiz.userPrompt(
+            safeText,
+            questionType,
+            count,
+            difficulty,
+            weakTopics,
+          ) + instructionBlock(taskParams.instruction),
       },
     ];
 
@@ -1100,6 +1264,54 @@ class AIService {
   }
 
   /**
+   * Resolve what a task should work on.
+   *
+   * With a docId the whole stored document is used — units joined with their
+   * anchors ("[Page 3]", "[Slide 7]", `[Sheet "Q3"]`) so the model can cite
+   * real locations. Without one, behaviour is exactly as before: the supplied
+   * text, or text extracted from an uploaded file.
+   *
+   * @returns {Promise<{text, source, totalChars, truncated, doc}>}
+   */
+  async resolveDocumentInput({ docId, text, file, userHash }) {
+    if (docId) {
+      const { getDocument } = require("./docStore");
+      const doc = await getDocument(docId, { userHash });
+      if (!doc) {
+        const err = new Error(
+          "Document not found or expired. Please re-upload the document.",
+        );
+        err.code = "DOC_NOT_FOUND";
+        throw err;
+      }
+
+      const fullText = (doc.units || [])
+        .map((unit) => `[${unit.label}]\n${unit.text}`)
+        .join("\n\n");
+
+      const limit = aiConfig.maxDocumentLength;
+      const truncated = fullText.length > limit;
+
+      return {
+        text: truncated ? fullText.slice(0, limit) : fullText,
+        source: "docId",
+        totalChars: fullText.length,
+        truncated,
+        doc,
+      };
+    }
+
+    const resolved = await this._resolveDocumentText(text, file);
+    return {
+      text: resolved,
+      source: file && !text ? "file" : "text",
+      totalChars: resolved.length,
+      truncated: false,
+      doc: null,
+    };
+  }
+
+  /**
    * Resolve document text from either raw text or a file upload.
    */
   async _resolveDocumentText(text, file) {
@@ -1110,10 +1322,23 @@ class AIService {
     throw err;
   }
 
+  /** Whether this build can run a given task. Used by capability discovery. */
+  supportsTask(task) {
+    return TASK_FORMATS[task] !== undefined;
+  }
+
   /**
    * Format a successful AI result into the stable response shape.
    */
-  _formatSuccess(task, result) {
+  _formatSuccess(task, result, coverageInput) {
+    const coverage = result.coverage || {
+      totalChars: coverageInput?.totalChars ?? (result.content || "").length,
+      processedChars: coverageInput?.totalChars ?? (result.content || "").length,
+      chunked: Boolean(result.chunked),
+      chunkCount: result.chunkCount || 1,
+      truncated: Boolean(coverageInput?.truncated),
+    };
+
     return {
       success: true,
       provider: result.provider || aiProvider.currentProvider,
@@ -1123,6 +1348,8 @@ class AIService {
         json: result.json || null,
         tasks: result.tasks || null,
         usage: result.usage || null,
+        format: TASK_FORMATS[task] || "text",
+        coverage,
       },
     };
   }

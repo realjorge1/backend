@@ -39,6 +39,18 @@ try {
  */
 function sendError(res, task, err) {
   const code = err.code || "AI_PROVIDER_ERROR";
+
+  // A task run against a docId that no longer exists answers with the
+  // document-route error body (contract C4), not the task error body: the
+  // app keys off `code` to re-upload and retry once.
+  if (code === "DOC_NOT_FOUND") {
+    logger.warn(`AI route [${task}]: document not found`);
+    return sendDocNotFound(res);
+  }
+  if (code === "STORE_UNAVAILABLE") {
+    return sendStoreUnavailable(res, err);
+  }
+
   const status =
     code === "VALIDATION_ERROR"
       ? 400
@@ -62,7 +74,40 @@ function sendError(res, task, err) {
 }
 
 /**
+ * The v2 fields every whole-document task route accepts (contract C5).
+ * Absent from the body, they resolve to undefined and the route behaves
+ * exactly as it did before.
+ */
+function documentTaskParams(req) {
+  const body = req.body || {};
+  const instruction = body.instruction;
+
+  if (instruction !== undefined && instruction !== null && instruction !== "") {
+    if (typeof instruction !== "string") {
+      const err = new Error("instruction must be a string");
+      err.code = "VALIDATION_ERROR";
+      throw err;
+    }
+    if (instruction.length > apiConfig.tasks.maxInstructionChars) {
+      const err = new Error(
+        `instruction exceeds maximum length of ${apiConfig.tasks.maxInstructionChars} characters`,
+      );
+      err.code = "VALIDATION_ERROR";
+      throw err;
+    }
+  }
+
+  return {
+    docId: typeof body.docId === "string" && body.docId ? body.docId : undefined,
+    instruction: instruction || undefined,
+    userHash: req.userHash,
+  };
+}
+
+/**
  * Validate that a text field doesn't exceed configured limits.
+ * Applies to text sent in the request, never to a stored document — those are
+ * bounded by aiConfig.maxDocumentLength and reported through coverage.
  */
 function validateLength(text, fieldName) {
   if (text && text.length > aiConfig.maxPromptLength) {
@@ -172,6 +217,35 @@ function wantsFullText(req) {
 }
 
 /**
+ * Assemble a task response: the standard envelope, the legacy top-level
+ * fields, and the v2 additions.
+ *
+ * Several routes have always overwritten `data` with their JSON payload
+ * (`data: result.data.json`), which means the envelope's `data.coverage`
+ * would be invisible on exactly those routes. Coverage and format are
+ * therefore exposed at the top level for every task route, and also merged
+ * into the legacy payload when that payload is a plain object — so a client
+ * can read either place. See the report: this is the one place where C5's
+ * "data gains coverage" could not hold literally.
+ */
+function taskResponse(result, legacy = {}) {
+  const coverage = result.data?.coverage;
+  const format = result.data?.format;
+  const body = { ...result, ...legacy, coverage, format };
+
+  const replacedData =
+    body.data &&
+    body.data !== result.data &&
+    typeof body.data === "object" &&
+    !Array.isArray(body.data);
+  if (replacedData) {
+    body.data = { ...body.data, coverage, format };
+  }
+
+  return body;
+}
+
+/**
  * Build legacy top-level fields for backward compatibility.
  * The frontend currently reads e.g. result.summary, result.translatedText, etc.
  */
@@ -272,11 +346,12 @@ router.post("/summarize", async (req, res) => {
     validateLength(req.body?.text, "text");
 
     const result = await aiService.run("summarize", {
+      ...documentTaskParams(req),
       text: req.body?.text,
       file,
     });
 
-    res.json({ ...result, summary: result.data.text });
+    res.json(taskResponse(result, { summary: result.data.text }));
   } catch (err) {
     sendError(res, "summarize", err);
   }
@@ -290,12 +365,13 @@ router.post("/translate", async (req, res) => {
     validateLength(text, "text");
 
     const result = await aiService.run("translate", {
+      ...documentTaskParams(req),
       text,
       file,
       targetLanguage,
     });
 
-    res.json({ ...result, translatedText: result.data.text });
+    res.json(taskResponse(result, { translatedText: result.data.text }));
   } catch (err) {
     sendError(res, "translate", err);
   }
@@ -316,7 +392,7 @@ router.post("/chat", async (req, res) => {
       history: typeof history === "string" ? JSON.parse(history) : history,
     });
 
-    res.json({ ...result, response: result.data.text });
+    res.json(taskResponse(result, { response: result.data.text }));
   } catch (err) {
     sendError(res, "chat", err);
   }
@@ -330,16 +406,18 @@ router.post("/analyze", async (req, res) => {
     validateLength(text, "text");
 
     const result = await aiService.run("analyze", {
+      ...documentTaskParams(req),
       text,
       file,
       analysisType,
     });
 
-    res.json({
-      ...result,
-      analysis: result.data.text,
-      data: result.data.json || null,
-    });
+    res.json(
+      taskResponse(result, {
+        analysis: result.data.text,
+        data: result.data.json || null,
+      }),
+    );
   } catch (err) {
     sendError(res, "analyze", err);
   }
@@ -352,15 +430,17 @@ router.post("/extract-tasks", async (req, res) => {
     validateLength(req.body?.text, "text");
 
     const result = await aiService.run("tasks", {
+      ...documentTaskParams(req),
       text: req.body?.text,
       file,
     });
 
-    res.json({
-      ...result,
-      tasks: result.data.tasks || result.data.text,
-      data: result.data.json || null,
-    });
+    res.json(
+      taskResponse(result, {
+        tasks: result.data.tasks || result.data.text,
+        data: result.data.json || null,
+      }),
+    );
   } catch (err) {
     sendError(res, "extract-tasks", err);
   }
@@ -401,7 +481,7 @@ router.post("/classify", async (req, res) => {
       filename,
     });
 
-    res.json({ ...result, data: result.data.json || result.data.text });
+    res.json(taskResponse(result, { data: result.data.json || result.data.text }));
   } catch (err) {
     sendError(res, "classify", err);
   }
@@ -414,11 +494,12 @@ router.post("/highlight", async (req, res) => {
     validateLength(req.body?.text, "text");
 
     const result = await aiService.run("highlight", {
+      ...documentTaskParams(req),
       text: req.body?.text,
       file,
     });
 
-    res.json({ ...result, data: result.data.json || result.data.text });
+    res.json(taskResponse(result, { data: result.data.json || result.data.text }));
   } catch (err) {
     sendError(res, "highlight", err);
   }
@@ -446,7 +527,7 @@ router.post("/highlight-summary", async (req, res) => {
       options,
     });
 
-    res.json({ ...result, data: result.data.json || result.data.text });
+    res.json(taskResponse(result, { data: result.data.json || result.data.text }));
   } catch (err) {
     sendError(res, "highlight-summary", err);
   }
@@ -502,7 +583,7 @@ router.post("/generate-document", async (req, res) => {
       audience,
     });
 
-    res.json({ ...result, generatedText: result.data.text });
+    res.json(taskResponse(result, { generatedText: result.data.text }));
   } catch (err) {
     sendError(res, "generate-document", err);
   }
@@ -515,12 +596,13 @@ router.post("/explain", async (req, res) => {
     validateLength(text, "text");
 
     const result = await aiService.run("explain", {
+      ...documentTaskParams(req),
       text,
       explainMode: mode,
       explainDepth: depth,
     });
 
-    res.json({ ...result, explanation: result.data.text });
+    res.json(taskResponse(result, { explanation: result.data.text }));
   } catch (err) {
     sendError(res, "explain", err);
   }
@@ -564,6 +646,7 @@ router.post("/quiz", async (req, res) => {
     }
 
     const result = await aiService.run("quiz", {
+      ...documentTaskParams(req),
       text,
       file,
       questionType: questionType || "mixed",
@@ -573,7 +656,7 @@ router.post("/quiz", async (req, res) => {
       retrievedContext,
     });
 
-    res.json({ ...result, data: result.data.json || result.data.text });
+    res.json(taskResponse(result, { data: result.data.json || result.data.text }));
   } catch (err) {
     sendError(res, "quiz", err);
   }

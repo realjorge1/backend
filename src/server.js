@@ -210,6 +210,10 @@ const server = app.listen(config.port, config.host, () => {
   server.timeout = 600000; // 10 min overall request timeout
   server.keepAliveTimeout = 65000; // slightly above typical LB idle timeouts
   server.headersTimeout = 70000;
+  // A whole-document task may legitimately run for up to 180s (contract C5).
+  // Node's default requestTimeout is 300s; pin it so a runtime change can't
+  // silently cut those requests short.
+  server.requestTimeout = 300000;
 
   logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   logger.info(`Inscribed Backend started`);
