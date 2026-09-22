@@ -900,6 +900,7 @@ router.post("/ask-pdf", async (req, res) => {
       citations: result.citations,
       found: result.found,
       retrieval: result.retrieval,
+      format: result.format,
       docMeta: {
         filename: doc.meta.filename,
         totalPages: doc.meta.totalPages,
@@ -1056,6 +1057,7 @@ router.post("/chat-document", async (req, res) => {
       found: result.found,
       retrievedChunks: result.retrievedChunks || [],
       retrieval: result.retrieval,
+      format: result.format,
       docMeta: {
         filename: doc.meta.filename,
         fileType: doc.meta.fileType || "pdf",
