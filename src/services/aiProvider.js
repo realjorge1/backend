@@ -192,6 +192,15 @@ class AIProviderManager {
   }
 
   /**
+   * Whether the active provider can stream text.
+   */
+  supportsStreaming() {
+    if (!this._initialized) this.initialize();
+    const provider = this.providers.get(this.currentProvider);
+    return Boolean(provider && typeof provider.chatStream === "function");
+  }
+
+  /**
    * Return current provider status for diagnostics.
    */
   getStatus() {

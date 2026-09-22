@@ -42,6 +42,11 @@ try {
   /* ignore */
 }
 
+// Render terminates TLS and proxies to us, so the client IP lives in
+// X-Forwarded-For. Without this every request looks like it came from the
+// proxy and per-IP rate limits would apply to the whole world at once.
+app.set("trust proxy", 1);
+
 app.use(logger.requestLogger);
 
 // CORS configuration — Allow all origins for mobile app
@@ -51,7 +56,16 @@ app.use(
   cors({
     origin: config.frontendUrl === "*" ? true : config.frontendUrl,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "X-App-Key",
+      "X-User-Id",
+      "X-Client-Version",
+      "X-Request-Id",
+    ],
+    exposedHeaders: ["X-Request-Id", "Retry-After"],
     credentials: config.frontendUrl !== "*",
   }),
 );
@@ -121,7 +135,7 @@ if (config.isDev) {
 app.use("/api/pdf", require("./routes/pdfRoutes"));
 app.use("/api/signing", require("./routes/signingRoutes"));
 app.use("/api/convert", require("./routes/convertRoutes"));
-app.use("/api/ai", require("./routes/aiRoutes"));
+require("./ai/mountAiApi").mountAiApi(app);
 app.use("/api/document", require("./routes/documentRoutes"));
 
 // ── New tool routes ─────────────────────────────────────────────────────────

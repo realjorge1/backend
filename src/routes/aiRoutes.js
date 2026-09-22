@@ -17,6 +17,10 @@ const {
   deleteDocument,
 } = require("../services/docStore");
 const { askPdf } = require("../services/aiQa");
+const apiConfig = require("../config/apiConfig");
+const { getCapabilities } = require("../ai/capabilities");
+const { authStatsHandler } = require("../middleware/aiAuth");
+const { requireAdmin } = require("../middleware/requireAdmin");
 
 // Initialize providers eagerly so startup logs show status
 try {
@@ -551,20 +555,33 @@ router.post("/ocr-scan", async (req, res) => {
 });
 
 // ============================================
-// GET /api/ai/status — Provider diagnostics
+// GET /api/ai/status — Provider diagnostics + capability discovery
+// Never requires auth: the app reads this before it has an app key.
 // ============================================
 router.get("/status", (req, res) => {
   try {
-    res.json({ success: true, ...aiProvider.getStatus() });
+    res.json({
+      success: true,
+      ...aiProvider.getStatus(),
+      apiVersion: apiConfig.apiVersion,
+      capabilities: getCapabilities(),
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 // ============================================
-// POST /api/ai/switch-provider — Runtime provider switch
+// GET /api/ai/admin/auth-stats — what monitor mode has seen (admin only)
 // ============================================
-router.post("/switch-provider", (req, res) => {
+router.get("/admin/auth-stats", authStatsHandler);
+
+// ============================================
+// POST /api/ai/switch-provider — Runtime provider switch (admin only)
+// Returns 404 when no ADMIN_TOKEN is configured, so the route simply doesn't
+// exist on a server that hasn't opted in.
+// ============================================
+router.post("/switch-provider", requireAdmin, (req, res) => {
   try {
     const { provider } = req.body || {};
     if (!provider) {
