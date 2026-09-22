@@ -103,15 +103,39 @@ function cleanAllPages(pages) {
  * @returns {Array<{chunkId: number, text: string, pages: number[]}>}
  */
 function chunkPages(pages) {
+  const units = pages.map((p, i) => ({
+    index: typeof p.page === "number" ? p.page : i + 1,
+    label: `Page ${typeof p.page === "number" ? p.page : i + 1}`,
+    text: p.text,
+  }));
+  return chunkUnits(units).map((c) => ({
+    chunkId: c.chunkId,
+    text: c.text,
+    pages: c.unitIndexes,
+  }));
+}
+
+/**
+ * Chunk document units (pages, slides, sheets, chapters, sections) into
+ * LLM-ready segments, each carrying its unit's label so an answer can be
+ * traced back to a citable location.
+ *
+ * @param {Array<{index: number, label: string, text: string}>} units
+ * @returns {Array<{chunkId: number, text: string, unitIndexes: number[]}>}
+ */
+function chunkUnits(units) {
   const chunks = [];
   let currentChunk = "";
   let currentPages = [];
   let chunkId = 0;
 
-  for (const { page, text } of pages) {
+  for (const unit of units) {
+    const page = unit.index;
+    const text = unit.text;
+    const label = unit.label || `Page ${page}`;
     if (!text || text.trim().length === 0) continue;
 
-    const pageBlock = `[Page ${page}]\n${text}`;
+    const pageBlock = `[${label}]\n${text}`;
 
     // If adding this page would exceed limit, flush current chunk first
     if (
@@ -121,7 +145,7 @@ function chunkPages(pages) {
       chunks.push({
         chunkId: chunkId++,
         text: currentChunk.trim(),
-        pages: [...currentPages],
+        unitIndexes: [...currentPages],
       });
       currentChunk = "";
       currentPages = [];
@@ -129,12 +153,12 @@ function chunkPages(pages) {
 
     // Handle very long single pages (split by paragraphs)
     if (pageBlock.length > MAX_CHUNK_CHARS) {
-      const subChunks = splitLargePage(page, text, MAX_CHUNK_CHARS);
+      const subChunks = splitLargePage(label, text, MAX_CHUNK_CHARS);
       for (const sub of subChunks) {
         chunks.push({
           chunkId: chunkId++,
           text: sub,
-          pages: [page],
+          unitIndexes: [page],
         });
       }
       continue;
@@ -149,7 +173,7 @@ function chunkPages(pages) {
     chunks.push({
       chunkId: chunkId++,
       text: currentChunk.trim(),
-      pages: [...currentPages],
+      unitIndexes: [...currentPages],
     });
   }
 
@@ -157,17 +181,17 @@ function chunkPages(pages) {
 }
 
 /**
- * Split a single very long page into multiple sub-chunks at paragraph boundaries.
+ * Split a single very long unit into multiple sub-chunks at paragraph boundaries.
  */
-function splitLargePage(pageNum, text, maxChars) {
+function splitLargePage(label, text, maxChars) {
   const paragraphs = text.split(/\n{2,}/);
   const subChunks = [];
-  let current = `[Page ${pageNum}]\n`;
+  let current = `[${label}]\n`;
 
   for (const para of paragraphs) {
     if (current.length + para.length > maxChars && current.length > 20) {
       subChunks.push(current.trim());
-      current = `[Page ${pageNum} continued]\n`;
+      current = `[${label} continued]\n`;
     }
     current += para + "\n\n";
   }
@@ -176,4 +200,4 @@ function splitLargePage(pageNum, text, maxChars) {
   return subChunks;
 }
 
-module.exports = { cleanAllPages, chunkPages };
+module.exports = { cleanAllPages, chunkPages, chunkUnits };

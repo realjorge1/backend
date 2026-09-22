@@ -229,6 +229,21 @@ const server = app.listen(config.port, config.host, () => {
     }
   }
 
+  // Selecting the store logs whether documents are shared across instances.
+  const docStore = require("./services/docStore");
+  const apiConfig = require("./config/apiConfig");
+  logger.info(`Auth mode: ${apiConfig.authMode}`);
+  logger.info(
+    `Documents: ${docStore.isPersistent() ? "postgres (shared)" : "in-memory (per-instance)"}`,
+  );
+
+  if (apiConfig.documents.runMigrations && apiConfig.documents.databaseUrl) {
+    require("../scripts/migrate")
+      .migrate(apiConfig.documents.databaseUrl)
+      .then(() => logger.info("Document store migration complete"))
+      .catch((err) => logger.error(`Document store migration failed: ${err.message}`));
+  }
+
   logger.info("Ready to receive requests");
   logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 

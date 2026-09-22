@@ -194,7 +194,43 @@ function tokenize(text) {
     .filter((w) => w.length > 2);
 }
 
+/**
+ * Embed a document's chunks during ingestion.
+ *
+ * The local TF-IDF fallback is deliberately not treated as an embedding
+ * provider: its vectors carry no cross-document meaning, so a document it
+ * "embedded" is really a keyword-retrieval document.
+ *
+ * @param {Array<{chunkId: number, text: string}>} chunks
+ * @returns {Promise<{chunks: Array, embedding: {provider, model, dims}|null}>}
+ */
+async function embedChunks(chunks) {
+  if (!chunks || chunks.length === 0) return { chunks: chunks || [], embedding: null };
+
+  const { embeddings, provider } = await generateEmbeddings(chunks.map((c) => c.text));
+  if (provider === "local" || provider === "none") {
+    return { chunks, embedding: null };
+  }
+
+  const embedded = chunks.map((chunk, i) => ({
+    ...chunk,
+    embedding: Array.isArray(embeddings[i]) && embeddings[i].length > 0 ? embeddings[i] : null,
+  }));
+  const dims = embedded.find((c) => c.embedding)?.embedding?.length || 0;
+  if (!dims) return { chunks, embedding: null };
+
+  const model =
+    provider === "openai"
+      ? "text-embedding-3-small"
+      : provider === "gemini"
+        ? "text-embedding-004"
+        : provider;
+
+  return { chunks: embedded, embedding: { provider, model, dims } };
+}
+
 module.exports = {
   generateEmbeddings,
   generateSingleEmbedding,
+  embedChunks,
 };

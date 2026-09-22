@@ -49,6 +49,8 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY package*.json ./
 COPY src ./src
+# scripts/migrate.js backs `npm run migrate` and RUN_MIGRATIONS=true at startup.
+COPY scripts ./scripts
 
 ENV NODE_ENV=production \
     PORT=10000 \

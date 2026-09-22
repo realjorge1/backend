@@ -15,6 +15,7 @@ const {
   saveDocument,
   getDocument,
   deleteDocument,
+  findByContentHash,
 } = require("../services/docStore");
 const { askPdf } = require("../services/aiQa");
 const apiConfig = require("../config/apiConfig");
@@ -71,6 +72,103 @@ function validateLength(text, fieldName) {
     err.code = "VALIDATION_ERROR";
     throw err;
   }
+}
+
+/**
+ * A document route was given a docId that isn't in the store (or has expired,
+ * or belongs to another user). The app re-uploads once and retries once.
+ */
+function sendDocNotFound(res) {
+  return res.status(404).json({
+    success: false,
+    code: "DOC_NOT_FOUND",
+    error: "Document not found or expired. Please re-upload the document.",
+  });
+}
+
+/**
+ * The document database is unreachable. This is one of the few genuine
+ * "this instance cannot serve the request" cases, so 503 is correct here and
+ * failing over to the other server is the right move.
+ */
+function sendStoreUnavailable(res, err) {
+  logger.error("Document store unavailable", { error: err.message });
+  return res.status(503).json({
+    success: false,
+    code: "UNAVAILABLE",
+    error: "Document storage is temporarily unavailable. Please try again.",
+  });
+}
+
+/**
+ * Load a stored document, answering the request directly when it can't be
+ * served. Returns null when a response has already been sent.
+ */
+async function fetchDocument(req, res, docId) {
+  try {
+    const doc = await getDocument(docId, { userHash: req.userHash });
+    if (!doc) {
+      sendDocNotFound(res);
+      return null;
+    }
+    return doc;
+  } catch (err) {
+    if (err.code === "STORE_UNAVAILABLE") {
+      sendStoreUnavailable(res, err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+/** sha256 of the uploaded bytes — used to skip re-processing the same file. */
+function hashContent(buffer) {
+  return require("crypto").createHash("sha256").update(buffer).digest("hex");
+}
+
+/**
+ * The response body shared by /extract-pdf and /extract-document. Keeps every
+ * field both routes returned before and adds the v2 fields from contract C4.
+ */
+function buildExtractResponse(doc, { includeFullText = true, suggestedPrompts } = {}) {
+  const units = doc.units || [];
+  const fullText = units
+    .map((u) => `[${u.label}]\n${u.text}`)
+    .join("\n\n");
+
+  const body = {
+    docId: doc.docId,
+    filename: doc.filename,
+    fileType: doc.fileType,
+    totalPages: doc.totalUnits,
+    scannedPages: doc.meta?.scannedPages || 0,
+    chunkCount: doc.chunks?.length || 0,
+    embeddingProvider: doc.embedding?.provider || "none",
+    preview: units[0]?.text?.slice(0, 300) || "",
+    // v2 additions
+    locatorType: doc.locatorType,
+    persisted: Boolean(doc.persisted),
+    expiresAt: doc.expiresAt ? new Date(doc.expiresAt).toISOString() : null,
+    retrievalMode: doc.embedding ? "hybrid" : "keyword",
+    embedding: doc.embedding
+      ? {
+          provider: doc.embedding.provider,
+          model: doc.embedding.model,
+          dims: doc.embedding.dims,
+        }
+      : null,
+    contentHash: doc.contentHash || null,
+    suggestedPrompts,
+  };
+
+  if (includeFullText) body.fullText = fullText;
+  return body;
+}
+
+/** `?includeFullText=0` opts out of the (potentially huge) fullText field. */
+function wantsFullText(req) {
+  const value = req.query?.includeFullText;
+  return !(value === "0" || value === "false");
 }
 
 /**
@@ -443,14 +541,25 @@ router.post("/quiz", async (req, res) => {
     // this gives the LLM the real document as grounding context.
     let retrievedContext = "";
     if (docId && typeof docId === "string") {
-      const doc = getDocument(docId);
+      let doc;
+      try {
+        doc = await getDocument(docId, { userHash: req.userHash });
+      } catch (err) {
+        if (err.code === "STORE_UNAVAILABLE") return sendStoreUnavailable(res, err);
+        throw err;
+      }
       if (doc) {
         retrievedContext = aiService.buildRetrievalContext(doc, {
           weakTopics: Array.isArray(weakTopics) ? weakTopics : [],
           budgetChars: 14000,
         });
+      } else if (!text) {
+        // No stored document and nothing to fall back on.
+        return sendDocNotFound(res);
       } else {
-        logger.warn(`[quiz] docId provided but not found in store: ${docId}`);
+        // Older app builds send both a docId and the document text. Falling
+        // back to the text keeps them working when the docId has expired.
+        logger.warn("[quiz] docId not found; falling back to supplied text");
       }
     }
 
@@ -622,52 +731,51 @@ router.post("/extract-pdf", async (req, res) => {
       `[extract-pdf] Starting extraction: ${filename} (${pdfBuffer.length} bytes)`,
     );
 
-    // Step 1: Extract raw text page by page
-    const { pages: rawPages, meta } = await extractPdfText(pdfBuffer);
+    const contentHash = hashContent(pdfBuffer);
+    const suggestedPrompts = [
+      "Summarize this document",
+      "What are the key findings or conclusions?",
+      "What is this document about?",
+      "List the main topics covered",
+    ];
 
-    // Step 2: Clean text (fix hyphenation, remove headers/footers, etc.)
-    const cleanedPages = cleanAllPages(rawPages);
+    // Same bytes, same user, still alive → hand back the existing document.
+    const existingId = await findByContentHash(contentHash, req.userHash);
+    if (existingId) {
+      const existing = await getDocument(existingId, { userHash: req.userHash });
+      if (existing) {
+        logger.info(`[extract-pdf] Reusing docId=${existingId} (identical upload)`);
+        return res.json(
+          buildExtractResponse(existing, {
+            includeFullText: wantsFullText(req),
+            suggestedPrompts,
+          }),
+        );
+      }
+    }
 
-    // Step 3: Chunk into LLM-ready segments with page anchors
-    const chunks = chunkPages(cleanedPages);
-
-    // Step 4: Store for later Q&A calls
-    const docId = saveDocument({
+    const ingested = await ingestDocument({
+      buffer: pdfBuffer,
       filename,
-      pages: cleanedPages,
-      chunks,
-      meta: {
-        ...meta,
-        filename,
-        extractedAt: new Date().toISOString(),
-      },
+      ext: ".pdf",
+      mimeType: "application/pdf",
+      contentHash,
+      userHash: req.userHash,
     });
 
     logger.info(
-      `[extract-pdf] Done: docId=${docId}, pages=${meta.totalPages}, chunks=${chunks.length}`,
+      `[extract-pdf] Done: docId=${ingested.docId}, pages=${ingested.totalUnits}, ` +
+        `chunks=${ingested.chunks.length}, embeddings=${ingested.embedding?.provider || "none"}`,
     );
 
-    // Build full extracted text for immediate use
-    const fullText = cleanedPages
-      .map((p) => `[Page ${p.page}]\n${p.text}`)
-      .join("\n\n");
-
-    res.json({
-      docId,
-      filename,
-      totalPages: meta.totalPages,
-      scannedPages: meta.scannedPages,
-      chunkCount: chunks.length,
-      preview: cleanedPages[0]?.text?.slice(0, 300) || "",
-      fullText,
-      suggestedPrompts: [
-        "Summarize this document",
-        "What are the key findings or conclusions?",
-        "What is this document about?",
-        "List the main topics covered",
-      ],
-    });
+    res.json(
+      buildExtractResponse(ingested, {
+        includeFullText: wantsFullText(req),
+        suggestedPrompts,
+      }),
+    );
   } catch (err) {
+    if (err.code === "STORE_UNAVAILABLE") return sendStoreUnavailable(res, err);
     logger.error("[extract-pdf] Error:", { error: err.message });
     res
       .status(500)
@@ -696,16 +804,10 @@ router.post("/ask-pdf", async (req, res) => {
         .json({ error: "Question is too long (max 2000 chars)." });
     }
 
-    const doc = getDocument(docId);
-    if (!doc) {
-      return res.status(404).json({
-        error: "Document not found or expired. Please re-upload the PDF.",
-      });
-    }
+    const doc = await fetchDocument(req, res, docId);
+    if (!doc) return undefined;
 
-    logger.info(
-      `[ask-pdf] docId=${docId} question="${question.slice(0, 80)}..."`,
-    );
+    logger.info(`[ask-pdf] docId=${docId} (${question.length} char question)`);
 
     const result = await askPdf(question.trim(), doc.chunks, doc.meta);
 
@@ -720,6 +822,7 @@ router.post("/ask-pdf", async (req, res) => {
       },
     });
   } catch (err) {
+    if (err.code === "STORE_UNAVAILABLE") return sendStoreUnavailable(res, err);
     logger.error("[ask-pdf] Error:", { error: err.message });
     res
       .status(500)
@@ -727,23 +830,26 @@ router.post("/ask-pdf", async (req, res) => {
   }
 });
 
-// DELETE /api/ai/doc/:docId — Manually clean up a document
-router.delete("/doc/:docId", (req, res) => {
-  const { docId } = req.params;
-  deleteDocument(docId);
-  res.json({ success: true });
+// DELETE /api/ai/doc/:docId — Permanently remove a document
+router.delete("/doc/:docId", async (req, res) => {
+  try {
+    await deleteDocument(req.params.docId);
+    res.json({ success: true });
+  } catch (err) {
+    if (err.code === "STORE_UNAVAILABLE") return sendStoreUnavailable(res, err);
+    logger.error("[delete-doc] Error:", { error: err.message });
+    res.status(500).json({ success: false, error: "Failed to delete document." });
+  }
 });
 
 // ============================================
 // Chat With Document — RAG-powered endpoints
 // ============================================
 
-const {
-  embedDocumentChunks,
-  chatWithDocument,
-} = require("../services/documentChatService");
+const { chatWithDocument } = require("../services/documentChatService");
+const { ingestDocument } = require("../services/documentIngest");
 
-// POST /api/ai/extract-document — Upload any document (PDF, DOCX, EPUB) and extract+embed
+// POST /api/ai/extract-document — Upload any supported document and extract+embed
 router.post("/extract-document", async (req, res) => {
   try {
     const file = req.files?.document || req.files?.file || req.files?.pdf;
@@ -756,273 +862,66 @@ router.post("/extract-document", async (req, res) => {
     const filename = file.name || "document";
     const ext = path.extname(filename).toLowerCase();
     const mimeType = (file.mimetype || "").toLowerCase();
-    const fileBuffer = file.data?.length ? file.data : await fs.readFile(file.tempFilePath);
+    const fileBuffer = file.data?.length
+      ? file.data
+      : await fs.readFile(file.tempFilePath);
 
     logger.info(
       `[extract-document] Starting: ${filename} (${fileBuffer.length} bytes, type=${ext})`,
     );
 
-    let pages, meta;
+    const contentHash = hashContent(fileBuffer);
+    const suggestedPrompts = [
+      "Summarize this document",
+      "What are the key findings or conclusions?",
+      "What is this document about?",
+      "List the main topics covered",
+      "What are the most important points?",
+    ];
 
-    // ── PDF extraction ──────────────────────────────────────────
-    if (ext === ".pdf" || mimeType === "application/pdf") {
-      const result = await extractPdfText(fileBuffer);
-      pages = cleanAllPages(result.pages);
-      meta = {
-        ...result.meta,
-        filename,
-        fileType: "pdf",
-        extractedAt: new Date().toISOString(),
-      };
-    }
-    // ── DOCX extraction ─────────────────────────────────────────
-    else if (
-      ext === ".docx" ||
-      mimeType ===
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ) {
-      const mammoth = require("mammoth");
-      const result = await mammoth.extractRawText({ buffer: fileBuffer });
-      const rawText = result.value || "";
-
-      // Split DOCX text into synthetic pages (~2000 chars each)
-      const CHARS_PER_PAGE = 2000;
-      pages = [];
-      for (let i = 0; i < rawText.length; i += CHARS_PER_PAGE) {
-        const pageText = rawText.slice(i, i + CHARS_PER_PAGE);
-        pages.push({
-          page: pages.length + 1,
-          text: pageText,
-          wasOcr: false,
-          charCount: pageText.length,
-        });
+    // Same bytes, same user, still alive → hand back the existing document.
+    const existingId = await findByContentHash(contentHash, req.userHash);
+    if (existingId) {
+      const existing = await getDocument(existingId, { userHash: req.userHash });
+      if (existing) {
+        logger.info(
+          `[extract-document] Reusing docId=${existingId} (identical upload)`,
+        );
+        return res.json(
+          buildExtractResponse(existing, {
+            includeFullText: wantsFullText(req),
+            suggestedPrompts,
+          }),
+        );
       }
-      if (pages.length === 0) {
-        pages = [
-          { page: 1, text: rawText, wasOcr: false, charCount: rawText.length },
-        ];
-      }
-
-      pages = cleanAllPages(pages);
-      meta = {
-        totalPages: pages.length,
-        scannedPages: 0,
-        hasScannedContent: false,
-        filename,
-        fileType: "docx",
-        extractedAt: new Date().toISOString(),
-      };
-    }
-    // ── EPUB extraction ─────────────────────────────────────────
-    else if (ext === ".epub" || mimeType === "application/epub+zip") {
-      const {
-        extractEpubText: extractEpub,
-        chaptersToPages,
-      } = require("../services/epubExtractor");
-
-      const { chapters, meta: epubMeta } = await extractEpub(fileBuffer);
-      pages = cleanAllPages(chaptersToPages(chapters));
-      meta = {
-        totalPages: epubMeta.totalChapters,
-        scannedPages: 0,
-        hasScannedContent: false,
-        filename,
-        fileType: "epub",
-        extractedAt: new Date().toISOString(),
-      };
-    }
-    // ── PPTX extraction ─────────────────────────────────────────
-    else if (
-      ext === ".pptx" ||
-      mimeType === "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-    ) {
-      const AdmZip = require("adm-zip");
-      const zip = new AdmZip(fileBuffer);
-      const slideEntries = zip
-        .getEntries()
-        .filter((e) => /^ppt\/slides\/slide\d+\.xml$/.test(e.entryName))
-        .sort((a, b) => a.entryName.localeCompare(b.entryName));
-
-      const slideTexts = slideEntries.map((entry, idx) => {
-        const xml = entry.getData().toString("utf8");
-        const texts = [];
-        const rx = /<a:t[^>]*>([^<]+)<\/a:t>/g;
-        let m;
-        while ((m = rx.exec(xml)) !== null) {
-          const t = m[1].trim();
-          if (t) texts.push(t);
-        }
-        return `[Slide ${idx + 1}]\n${texts.join(" ")}`;
-      });
-
-      const rawText = slideTexts.filter((s) => s.trim()).join("\n\n");
-      const CHARS_PER_PAGE = 2000;
-      pages = [];
-      for (let i = 0; i < rawText.length; i += CHARS_PER_PAGE) {
-        const pageText = rawText.slice(i, i + CHARS_PER_PAGE);
-        pages.push({ page: pages.length + 1, text: pageText, wasOcr: false, charCount: pageText.length });
-      }
-      if (pages.length === 0) {
-        pages = [{ page: 1, text: rawText || "(No text found in slides)", wasOcr: false, charCount: 0 }];
-      }
-      pages = cleanAllPages(pages);
-      meta = {
-        totalPages: pages.length,
-        scannedPages: 0,
-        hasScannedContent: false,
-        filename,
-        fileType: "pptx",
-        extractedAt: new Date().toISOString(),
-      };
-    }
-    // ── XLSX extraction ─────────────────────────────────────────
-    else if (
-      ext === ".xlsx" ||
-      mimeType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    ) {
-      const AdmZip = require("adm-zip");
-      const zip = new AdmZip(fileBuffer);
-
-      // Shared strings table holds all text cell values
-      const ssEntry = zip.getEntry("xl/sharedStrings.xml");
-      const strings = [];
-      if (ssEntry) {
-        const xml = ssEntry.getData().toString("utf8");
-        const rx = /<t[^>]*>([^<]*)<\/t>/g;
-        let m;
-        while ((m = rx.exec(xml)) !== null) {
-          if (m[1].trim()) strings.push(m[1]);
-        }
-      }
-
-      // Also pull inline strings directly from worksheets
-      const sheetEntries = zip
-        .getEntries()
-        .filter((e) => /^xl\/worksheets\/sheet\d*\.xml$/.test(e.entryName));
-      const inlineTexts = [];
-      for (const entry of sheetEntries) {
-        const xml = entry.getData().toString("utf8");
-        const rx = /<is>[\s\S]*?<t[^>]*>([^<]+)<\/t>[\s\S]*?<\/is>/g;
-        let m;
-        while ((m = rx.exec(xml)) !== null) {
-          if (m[1].trim()) inlineTexts.push(m[1]);
-        }
-      }
-
-      const allStrings = [...strings, ...inlineTexts];
-      const rawText = allStrings.join(" ");
-      const CHARS_PER_PAGE = 2000;
-      pages = [];
-      for (let i = 0; i < rawText.length; i += CHARS_PER_PAGE) {
-        const pageText = rawText.slice(i, i + CHARS_PER_PAGE);
-        pages.push({ page: pages.length + 1, text: pageText, wasOcr: false, charCount: pageText.length });
-      }
-      if (pages.length === 0) {
-        pages = [{ page: 1, text: "(No text content found in spreadsheet)", wasOcr: false, charCount: 0 }];
-      }
-      pages = cleanAllPages(pages);
-      meta = {
-        totalPages: pages.length,
-        scannedPages: 0,
-        hasScannedContent: false,
-        filename,
-        fileType: "xlsx",
-        extractedAt: new Date().toISOString(),
-      };
-    }
-    // ── TXT and other text files ────────────────────────────────
-    else if (
-      mimeType.startsWith("text/") ||
-      [".txt", ".md", ".csv"].includes(ext)
-    ) {
-      const rawText = fileBuffer.toString("utf-8");
-      const CHARS_PER_PAGE = 2000;
-      pages = [];
-      for (let i = 0; i < rawText.length; i += CHARS_PER_PAGE) {
-        const pageText = rawText.slice(i, i + CHARS_PER_PAGE);
-        pages.push({
-          page: pages.length + 1,
-          text: pageText,
-          wasOcr: false,
-          charCount: pageText.length,
-        });
-      }
-      if (pages.length === 0) {
-        pages = [
-          { page: 1, text: rawText, wasOcr: false, charCount: rawText.length },
-        ];
-      }
-
-      meta = {
-        totalPages: pages.length,
-        scannedPages: 0,
-        hasScannedContent: false,
-        filename,
-        fileType: "txt",
-        extractedAt: new Date().toISOString(),
-      };
-    } else {
-      return res
-        .status(400)
-        .json({ error: `Unsupported file type: ${ext || mimeType}` });
     }
 
-    // Chunk the pages
-    const chunks = chunkPages(pages);
-
-    // Generate embeddings for the chunks
-    let chunkEmbeddings = [];
-    let embeddingProvider = "none";
-    try {
-      const embResult = await embedDocumentChunks(chunks);
-      chunkEmbeddings = embResult.chunkEmbeddings;
-      embeddingProvider = embResult.embeddingProvider;
-    } catch (embErr) {
-      logger.warn(
-        "[extract-document] Embedding failed, using chunks without embeddings:",
-        embErr.message,
-      );
-      chunkEmbeddings = chunks.map((c) => ({ ...c, embedding: [] }));
-    }
-
-    // Save to document store
-    const docId = saveDocument({
+    const ingested = await ingestDocument({
+      buffer: fileBuffer,
       filename,
-      pages,
-      chunks,
-      chunkEmbeddings,
-      embeddingProvider,
-      meta,
+      ext,
+      mimeType,
+      contentHash,
+      userHash: req.userHash,
     });
-
-    // Build full text for preview
-    const fullText = pages
-      .map((p) => `[Page ${p.page}]\n${p.text}`)
-      .join("\n\n");
 
     logger.info(
-      `[extract-document] Done: docId=${docId}, pages=${meta.totalPages}, chunks=${chunks.length}, embeddings=${embeddingProvider}`,
+      `[extract-document] Done: docId=${ingested.docId}, ` +
+        `${ingested.locatorType}s=${ingested.totalUnits}, chunks=${ingested.chunks.length}, ` +
+        `embeddings=${ingested.embedding?.provider || "none"}`,
     );
 
-    res.json({
-      docId,
-      filename,
-      fileType: meta.fileType,
-      totalPages: meta.totalPages,
-      scannedPages: meta.scannedPages || 0,
-      chunkCount: chunks.length,
-      embeddingProvider,
-      preview: pages[0]?.text?.slice(0, 300) || "",
-      fullText,
-      suggestedPrompts: [
-        "Summarize this document",
-        "What are the key findings or conclusions?",
-        "What is this document about?",
-        "List the main topics covered",
-        "What are the most important points?",
-      ],
-    });
+    res.json(
+      buildExtractResponse(ingested, {
+        includeFullText: wantsFullText(req),
+        suggestedPrompts,
+      }),
+    );
   } catch (err) {
+    if (err.code === "STORE_UNAVAILABLE") return sendStoreUnavailable(res, err);
+    if (err.code === "UNSUPPORTED_FILE_TYPE") {
+      return res.status(400).json({ error: err.message });
+    }
     logger.error("[extract-document] Error:", { error: err.message });
     res.status(500).json({
       error: "Failed to extract document.",
@@ -1052,16 +951,10 @@ router.post("/chat-document", async (req, res) => {
         .json({ error: "Question is too long (max 2000 chars)." });
     }
 
-    const doc = getDocument(docId);
-    if (!doc) {
-      return res.status(404).json({
-        error: "Document not found or expired. Please re-upload the document.",
-      });
-    }
+    const doc = await fetchDocument(req, res, docId);
+    if (!doc) return undefined;
 
-    logger.info(
-      `[chat-document] docId=${docId} question="${question.slice(0, 80)}..."`,
-    );
+    logger.info(`[chat-document] docId=${docId} (${question.length} char question)`);
 
     // Parse history if it's a string
     const parsedHistory =
@@ -1101,6 +994,7 @@ router.post("/chat-document", async (req, res) => {
       },
     });
   } catch (err) {
+    if (err.code === "STORE_UNAVAILABLE") return sendStoreUnavailable(res, err);
     logger.error("[chat-document] Error:", { error: err.message });
     res.status(500).json({
       error: "Failed to answer question.",
