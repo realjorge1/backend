@@ -1,0 +1,332 @@
+{
+  "GET /status": {
+    "status": 200,
+    "shape": {
+      "availableProviders": [
+        "string"
+      ],
+      "currentProvider": "string",
+      "fallbackEnabled": "boolean",
+      "fallbackOrder": [
+        "string"
+      ],
+      "success": "boolean"
+    }
+  },
+  "POST /summarize": {
+    "status": 200,
+    "shape": {
+      "data": {
+        "json": "null",
+        "tasks": "null",
+        "text": "string",
+        "usage": {
+          "completionTokens": "number",
+          "promptTokens": "number",
+          "totalTokens": "number"
+        }
+      },
+      "provider": "string",
+      "success": "boolean",
+      "summary": "string",
+      "task": "string"
+    }
+  },
+  "POST /translate": {
+    "status": 200,
+    "shape": {
+      "data": {
+        "json": "null",
+        "tasks": "null",
+        "text": "string",
+        "usage": {
+          "completionTokens": "number",
+          "promptTokens": "number",
+          "totalTokens": "number"
+        }
+      },
+      "provider": "string",
+      "success": "boolean",
+      "task": "string",
+      "translatedText": "string"
+    }
+  },
+  "POST /translate (error)": {
+    "status": 400,
+    "shape": {
+      "error": {
+        "code": "string",
+        "message": "string"
+      },
+      "provider": "string",
+      "success": "boolean",
+      "task": "string"
+    }
+  },
+  "POST /chat": {
+    "status": 200,
+    "shape": {
+      "data": {
+        "json": "null",
+        "tasks": "null",
+        "text": "string",
+        "usage": {
+          "completionTokens": "number",
+          "promptTokens": "number",
+          "totalTokens": "number"
+        }
+      },
+      "provider": "string",
+      "response": "string",
+      "success": "boolean",
+      "task": "string"
+    }
+  },
+  "POST /analyze": {
+    "status": 200,
+    "shape": {
+      "analysis": "string",
+      "data": {
+        "insights": [
+          {
+            "detail": "string",
+            "title": "string"
+          }
+        ],
+        "readability": {
+          "level": "string",
+          "notes": "string"
+        },
+        "recommendations": [
+          "string"
+        ],
+        "sentiment": "string",
+        "sentimentScore": "number",
+        "strengths": [
+          "string"
+        ],
+        "summary": "string",
+        "topics": [
+          "string"
+        ],
+        "weaknesses": [
+          "string"
+        ]
+      },
+      "provider": "string",
+      "success": "boolean",
+      "task": "string"
+    }
+  },
+  "POST /extract-tasks": {
+    "status": 200,
+    "shape": {
+      "data": {
+        "tasks": [
+          {
+            "action": "string",
+            "category": "string",
+            "context": "string",
+            "deadline": "string",
+            "id": "string",
+            "owner": "string",
+            "priority": "string"
+          }
+        ]
+      },
+      "provider": "string",
+      "success": "boolean",
+      "task": "string",
+      "tasks": [
+        {
+          "action": "string",
+          "category": "string",
+          "context": "string",
+          "deadline": "string",
+          "id": "string",
+          "owner": "string",
+          "priority": "string"
+        }
+      ]
+    }
+  },
+  "POST /highlight": {
+    "status": 200,
+    "shape": {
+      "data": {
+        "highlights": [
+          {
+            "category": "string",
+            "confidence": "number",
+            "importance": "string",
+            "reason": "string",
+            "sourceReference": {
+              "page": "number",
+              "paragraphIndex": "number",
+              "snippet": "string"
+            },
+            "text": "string"
+          }
+        ],
+        "meta": {
+          "documentType": "string",
+          "keyThemes": [
+            "string"
+          ],
+          "pageDensity": [
+            {
+              "count": "number",
+              "page": "number"
+            }
+          ],
+          "summary": [
+            "string"
+          ]
+        }
+      },
+      "provider": "string",
+      "success": "boolean",
+      "task": "string"
+    }
+  },
+  "POST /explain": {
+    "status": 200,
+    "shape": {
+      "data": {
+        "json": "null",
+        "tasks": "null",
+        "text": "string",
+        "usage": {
+          "completionTokens": "number",
+          "promptTokens": "number",
+          "totalTokens": "number"
+        }
+      },
+      "explanation": "string",
+      "provider": "string",
+      "success": "boolean",
+      "task": "string"
+    }
+  },
+  "POST /quiz": {
+    "status": 200,
+    "shape": {
+      "data": {
+        "insufficient": "boolean",
+        "questions": [
+          {
+            "answer": "string",
+            "difficulty": "string",
+            "explanation": "string",
+            "id": "string",
+            "question": "string",
+            "source_reference": {
+              "page": "number",
+              "paragraphIndex": "number",
+              "snippet": "string"
+            },
+            "source_text": "string",
+            "topic": "string",
+            "type": "string"
+          }
+        ],
+        "requestedCount": "number",
+        "validCount": "number"
+      },
+      "provider": "string",
+      "success": "boolean",
+      "task": "string"
+    }
+  },
+  "POST /extract-pdf": {
+    "status": 200,
+    "shape": {
+      "chunkCount": "number",
+      "docId": "string",
+      "filename": "string",
+      "fullText": "string",
+      "preview": "string",
+      "scannedPages": "number",
+      "suggestedPrompts": [
+        "string"
+      ],
+      "totalPages": "number"
+    }
+  },
+  "POST /ask-pdf": {
+    "status": 200,
+    "shape": {
+      "answer": "string",
+      "citations": [
+        {
+          "page": "number",
+          "quote": "string"
+        }
+      ],
+      "docMeta": {
+        "filename": "string",
+        "totalPages": "number"
+      },
+      "found": "boolean",
+      "question": "string"
+    }
+  },
+  "POST /ask-pdf (missing doc)": {
+    "status": 404,
+    "shape": {
+      "error": "string"
+    }
+  },
+  "POST /extract-document": {
+    "status": 200,
+    "shape": {
+      "chunkCount": "number",
+      "docId": "string",
+      "embeddingProvider": "string",
+      "fileType": "string",
+      "filename": "string",
+      "fullText": "string",
+      "preview": "string",
+      "scannedPages": "number",
+      "suggestedPrompts": [
+        "string"
+      ],
+      "totalPages": "number"
+    }
+  },
+  "POST /chat-document": {
+    "status": 200,
+    "shape": {
+      "answer": "string",
+      "citations": [
+        {
+          "page": "number",
+          "quote": "string"
+        }
+      ],
+      "docMeta": {
+        "fileType": "string",
+        "filename": "string",
+        "totalPages": "number"
+      },
+      "found": "boolean",
+      "question": "string",
+      "retrievedChunks": [
+        {
+          "chunkId": "number",
+          "pages": [
+            "number"
+          ],
+          "preview": "string",
+          "score": "number"
+        }
+      ]
+    }
+  },
+  "DELETE /doc/:docId": {
+    "status": 200,
+    "shape": {
+      "success": "boolean"
+    }
+  }
+}

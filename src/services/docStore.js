@@ -62,7 +62,7 @@ function deleteDocument(docId) {
 }
 
 /** Periodically purge expired in-memory entries */
-setInterval(
+const purgeTimer = setInterval(
   () => {
     const now = Date.now();
     for (const [id, doc] of store.entries()) {
@@ -71,5 +71,6 @@ setInterval(
   },
   15 * 60 * 1000,
 ); // every 15 minutes
+purgeTimer.unref();
 
 module.exports = { saveDocument, getDocument, deleteDocument };
