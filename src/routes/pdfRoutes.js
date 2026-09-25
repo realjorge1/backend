@@ -154,8 +154,10 @@ router.post("/merge", async (req, res) => {
   } catch (error) {
     const duration = Date.now() - startTime;
     console.error(`[PDF:merge] ❌ Failed after ${duration}ms:`, error.message);
-    res.status(500).json({
-      error: "Failed to merge PDFs",
+    // 4xx (e.g. PASSWORD_PROTECTED): `message` is written for the user.
+    res.status(error.statusCode || 500).json({
+      error: error.statusCode ? "Can't merge these files" : "Failed to merge PDFs",
+      code: error.code || "MERGE_FAILED",
       message: error.message,
     });
   }
@@ -391,18 +393,36 @@ router.post("/watermark", async (req, res) => {
       });
     }
 
-    const { text, fontSize, opacity } = req.body;
-    if (!text) {
+    const { text, fontSize, opacity, logoPosition } = req.body;
+    // The logo travels as its own "logo" field: the upload normalizer copies
+    // the first file (the PDF) onto pdf/image/etc., so those names are taken.
+    const logoFile = Array.isArray(req.files.logo)
+      ? req.files.logo[0]
+      : req.files.logo;
+    if (!text && !logoFile) {
       return res.status(400).json({
         error: "Missing parameter",
-        message: "text parameter is required for watermark",
+        message: "Enter watermark text or add a logo",
       });
     }
 
-    console.log(`💧 Adding watermark: "${text}"...`);
+    let logo;
+    if (logoFile) {
+      logo = await pdfService.readFileBytes(logoFile);
+      if (!pdfService.isPngBuffer(logo) && !pdfService.isJpegBuffer(logo)) {
+        return res.status(400).json({
+          error: "Unsupported logo",
+          message: "The logo must be a PNG or JPG image",
+        });
+      }
+    }
+
+    console.log(`💧 Adding watermark: "${text || ""}"${logo ? " + logo" : ""}...`);
     const options = {
       fontSize: parseInt(fontSize) || 50,
       opacity: parseFloat(opacity) || 0.3,
+      logo,
+      logoPosition,
     };
 
     const resultPdf = await pdfService.addWatermark(
@@ -1075,7 +1095,31 @@ router.post("/stamp", async (req, res) => {
 
     // Accept both 'stamp' (text) and 'stampType' (preset)
     const stamp = req.body.stamp || req.body.stampType || "approved";
-    const resultPdf = await pdfService.stampPDF(req.files.pdf, stamp);
+
+    // Optional placement (PDF points, bottom-left origin) and 1-based pages.
+    const num = (v) => (v === undefined || v === "" ? undefined : Number(v));
+    let pages;
+    if (req.body.pages) {
+      try {
+        pages = JSON.parse(req.body.pages);
+      } catch {
+        pages = undefined;
+      }
+      if (!Array.isArray(pages)) {
+        return res.status(400).json({
+          error: "Invalid pages",
+          message: "pages must be a list of page numbers, e.g. [1, 3]",
+        });
+      }
+    }
+
+    const resultPdf = await pdfService.stampPDF(req.files.pdf, stamp, {
+      x: num(req.body.x),
+      y: num(req.body.y),
+      width: num(req.body.width),
+      height: num(req.body.height),
+      pages,
+    });
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", "attachment; filename=stamped.pdf");

@@ -42,6 +42,17 @@ async function readFileBytes(file) {
   }
 }
 
+// Image formats are detected by magic bytes, never by file extension.
+/** PNG signature: 89 50 4E 47. */
+function isPngBuffer(buf) {
+  return buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+}
+
+/** JPEG signature: FF D8 FF. */
+function isJpegBuffer(buf) {
+  return buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+}
+
 // ── safeLoadPDF ─────────────────────────────────────────────────────────────
 // pdf-lib requires the %PDF- signature to appear at or very near byte 0.
 // Some files have a leading BOM, whitespace, or a partial HTTP header prepended
@@ -120,6 +131,50 @@ async function safeLoadPDF(bytes, opts = {}) {
   } finally {
     fs.unlink(tmpIn).catch(() => {});
   }
+}
+
+// ── decryptWithoutPassword ──────────────────────────────────────────────────
+// Many PDFs are encrypted only to restrict permissions (printing, copying):
+// the user password is empty, so any reader opens them. pdf-lib can't read
+// encrypted objects (the catalog comes back undefined), so decrypt those
+// first — qpdf, then the built-in RC4 decryptor. Returns null when the file
+// needs a real password.
+async function decryptWithoutPassword(bytes) {
+  const id = crypto.randomBytes(8).toString("hex");
+  const tmpIn = path.join(os.tmpdir(), `inscribed_decrypt_${id}.pdf`);
+  const tmpOut = path.join(os.tmpdir(), `inscribed_decrypt_${id}_out.pdf`);
+  try {
+    await fs.writeFile(tmpIn, bytes);
+    try {
+      await execFileAsync("qpdf", ["--password=", "--decrypt", tmpIn, tmpOut], {
+        timeout: 30000,
+      });
+    } catch (err) {
+      // Exit code 3 = decrypted with warnings; anything else failed
+      if (err.code !== 3) throw err;
+    }
+    return await fs.readFile(tmpOut);
+  } catch {
+    // qpdf missing, or the file needs a password — try the built-in decryptor
+  } finally {
+    fs.unlink(tmpIn).catch(() => {});
+    fs.unlink(tmpOut).catch(() => {});
+  }
+  try {
+    return decryptPdfBuffer(bytes, "");
+  } catch {
+    return null;
+  }
+}
+
+/** A PDF we can't open without its password. Routes answer 400 with it. */
+function passwordProtectedError(fileName) {
+  const err = new Error(
+    `"${fileName}" is password-protected. Remove its password with the Unlock PDF tool, then try again.`,
+  );
+  err.code = "PASSWORD_PROTECTED";
+  err.statusCode = 400;
+  return err;
 }
 
 // ── Memory-bounded sharp configuration ─────────────────────────────────────
@@ -209,15 +264,23 @@ class PDFService {
       const file = files[i];
       try {
         const pdfBytes = await readFileBytes(file);
-        const pdf = await safeLoadPDF(pdfBytes, {
+        let pdf = await safeLoadPDF(pdfBytes, {
           ignoreEncryption: true,
         });
+        if (pdf.isEncrypted) {
+          const decrypted = await decryptWithoutPassword(pdfBytes);
+          if (decrypted) pdf = await safeLoadPDF(decrypted);
+          if (pdf.isEncrypted) {
+            throw passwordProtectedError(file.name || `File ${i + 1}`);
+          }
+        }
         const copiedPages = await mergedPdf.copyPages(
           pdf,
           pdf.getPageIndices(),
         );
         copiedPages.forEach((page) => mergedPdf.addPage(page));
       } catch (err) {
+        if (err.statusCode) throw err;
         throw new Error(
           `Failed to process file ${i + 1} (${file.name || "unknown"}): ${err.message}`,
         );
@@ -296,6 +359,11 @@ class PDFService {
   }
 
   // Add watermark
+  /**
+   * Text and/or logo watermark on every page. options.logo is a PNG or JPEG
+   * buffer, drawn at options.logoPosition ("center", "top-left", "top-right",
+   * "bottom-left", "bottom-right") with the same opacity as the text.
+   */
   async addWatermark(file, watermarkText, options = {}) {
     const pdfBytes = await readFileBytes(file);
     const pdf = await safeLoadPDF(pdfBytes);
@@ -306,18 +374,50 @@ class PDFService {
       opacity = 0.3,
       color = { r: 0.5, g: 0.5, b: 0.5 },
       rotation = 45,
+      logo,
+      logoPosition = "center",
     } = options;
+
+    let logoImage = null;
+    if (logo) {
+      logoImage = isPngBuffer(logo)
+        ? await pdf.embedPng(logo)
+        : await pdf.embedJpg(logo);
+    }
+    // Anything but the four corners (including unknown values) is centred.
+    const corner = ["top-left", "top-right", "bottom-left", "bottom-right"].includes(logoPosition)
+      ? logoPosition.split("-")
+      : null;
 
     pages.forEach((page) => {
       const { width, height } = page.getSize();
-      page.drawText(watermarkText, {
-        x: width / 2 - (watermarkText.length * fontSize) / 4,
-        y: height / 2,
-        size: fontSize,
-        color: rgb(color.r, color.g, color.b),
-        opacity: opacity,
-        rotate: degrees(rotation),
-      });
+      if (watermarkText) {
+        page.drawText(watermarkText, {
+          x: width / 2 - (watermarkText.length * fontSize) / 4,
+          y: height / 2,
+          size: fontSize,
+          color: rgb(color.r, color.g, color.b),
+          opacity: opacity,
+          rotate: degrees(rotation),
+        });
+      }
+      if (logoImage) {
+        // Up to 30% of the page width / 25% of its height, aspect kept.
+        const scale = Math.min(
+          (width * 0.3) / logoImage.width,
+          (height * 0.25) / logoImage.height,
+        );
+        const w = logoImage.width * scale;
+        const h = logoImage.height * scale;
+        const margin = 36;
+        let x = (width - w) / 2;
+        let y = (height - h) / 2;
+        if (corner) {
+          x = corner[1] === "left" ? margin : width - w - margin;
+          y = corner[0] === "top" ? height - h - margin : margin;
+        }
+        page.drawImage(logoImage, { x, y, width: w, height: h, opacity });
+      }
     });
 
     const watermarkedPdfBytes = await pdf.save();
@@ -1194,18 +1294,47 @@ class PDFService {
     return Buffer.from(drawnBytes);
   }
 
-  // Add stamp - draws a visible, bordered stamp on every page
-  async stampPDF(file, stamp) {
+  /**
+   * Add a visible, bordered stamp.
+   * options.pages: 1-based page numbers (default: every page).
+   * options.x/y/width/height: the box the user placed, in PDF points from the
+   * bottom-left — the stamp is sized to fit it and centred inside. Without a
+   * position the stamp goes top-right at 28pt (the original behaviour).
+   */
+  async stampPDF(file, stamp, options = {}) {
     const pdfBytes = await readFileBytes(file);
     const pdf = await safeLoadPDF(pdfBytes);
-    const pages = pdf.getPages();
+    const allPages = pdf.getPages();
     const font = await pdf.embedFont("Helvetica-Bold");
 
     const stampText = (stamp || "APPROVED").toUpperCase();
-    const fontSize = 28;
+    // Padding is 12pt at the default 28pt size; keep that ratio when fitting.
+    const PADDING_RATIO = 12 / 28;
+
+    const { x: boxX, y: boxY } = options;
+    const placed = Number.isFinite(boxX) && Number.isFinite(boxY);
+    const boxWidth = options.width > 0 ? options.width : undefined;
+    const boxHeight = options.height > 0 ? options.height : undefined;
+    let fontSize = 28;
+    if (placed && boxWidth && boxHeight) {
+      const unitTextWidth = font.widthOfTextAtSize(stampText, 1);
+      const byWidth = boxWidth / (unitTextWidth + 2 * PADDING_RATIO);
+      const byHeight = boxHeight / (1 + 2 * PADDING_RATIO);
+      fontSize = Math.max(8, Math.min(72, byWidth, byHeight));
+    }
+    // Measured at the final size so the default stamp is drawn exactly as before.
     const textWidth = font.widthOfTextAtSize(stampText, fontSize);
     const textHeight = fontSize;
-    const padding = 12;
+    const padding = (fontSize * 12) / 28;
+
+    const requested = Array.isArray(options.pages)
+      ? [...new Set(options.pages.map((n) => parseInt(n, 10) - 1))].filter(
+          (i) => i >= 0 && i < allPages.length,
+        )
+      : [];
+    const pages = requested.length
+      ? requested.map((i) => allPages[i])
+      : allPages;
 
     // Choose stamp color based on type
     let stampColor;
@@ -1225,8 +1354,15 @@ class PDFService {
       const { width, height } = page.getSize();
       const boxW = textWidth + padding * 2;
       const boxH = textHeight + padding * 2;
-      const x = width - boxW - 30;
-      const y = height - boxH - 30;
+      let x = width - boxW - 30;
+      let y = height - boxH - 30;
+      if (placed) {
+        // Centre in the placed box, kept on the page (sizes can differ).
+        x = boxX + ((boxWidth || boxW) - boxW) / 2;
+        y = boxY + ((boxHeight || boxH) - boxH) / 2;
+        x = Math.max(0, Math.min(x, width - boxW));
+        y = Math.max(0, Math.min(y, height - boxH));
+      }
 
       // Draw border rectangle
       page.drawRectangle({
@@ -2179,4 +2315,6 @@ class PDFService {
 const pdfServiceInstance = new PDFService();
 pdfServiceInstance.safeLoadPDF = safeLoadPDF;
 pdfServiceInstance.readFileBytes = readFileBytes;
+pdfServiceInstance.isPngBuffer = isPngBuffer;
+pdfServiceInstance.isJpegBuffer = isJpegBuffer;
 module.exports = pdfServiceInstance;

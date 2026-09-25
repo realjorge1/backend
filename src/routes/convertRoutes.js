@@ -4,6 +4,7 @@ const convertService = require("../services/convertService");
 const officeConversionService = require("../services/officeConversionService");
 const archiver = require("archiver");
 const fsAsync = require("fs").promises;
+const { outputPath, toDownloadUrl } = require("../utils/fileOutputUtils");
 
 // Images to PDF
 router.post("/images-to-pdf", async (req, res) => {
@@ -187,51 +188,62 @@ router.post("/excel-to-pdf", async (req, res) => {
   }
 });
 
-// PDF to JPG — always returns a single image (page 1, or page specified by ?page=N)
-router.post("/pdf-to-jpg", async (req, res) => {
-  try {
-    if (!req.files || !req.files.pdf) {
-      return res.status(400).json({ error: "No PDF uploaded" });
+/**
+ * PDF to JPG / PNG.
+ * Default: a single image (page 1, or the page given by `page`) — what older
+ * app builds expect. With allPages=true: every page is saved and returned as
+ * { success, totalPages, files: [{ filename, url, size }] }, the same shape as
+ * /pdf/split.
+ */
+function pdfToImageRoute(format, mimeType, label) {
+  return async (req, res) => {
+    try {
+      if (!req.files || !req.files.pdf) {
+        return res.status(400).json({ error: "No PDF uploaded" });
+      }
+
+      const images = await convertService.pdfToImages(req.files.pdf, format);
+
+      if (req.body.allPages === "true") {
+        if (images.length === 0) {
+          return res.status(500).json({ error: "No image generated" });
+        }
+        const base =
+          (req.files.pdf.name || "document")
+            .replace(/\.pdf$/i, "")
+            .replace(/[^\w\s-]/g, "")
+            .trim() || "document";
+        const files = [];
+        for (let i = 0; i < images.length; i++) {
+          const outFile = outputPath(`.${format}`);
+          await fsAsync.writeFile(outFile, images[i]);
+          files.push({
+            filename: `${base}_page_${i + 1}.${format}`,
+            url: toDownloadUrl(req, outFile),
+            size: images[i].length,
+          });
+        }
+        return res.json({ success: true, totalPages: files.length, files });
+      }
+
+      const page = Math.max(1, parseInt(req.body.page, 10) || 1);
+      const image = images[page - 1] ?? images[0];
+      if (!image) {
+        return res.status(500).json({ error: "No image generated" });
+      }
+
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader("Content-Disposition", `attachment; filename=page-${page}.${format}`);
+      res.send(image);
+    } catch (error) {
+      console.error(`PDF to ${label} error:`, error);
+      res.status(500).json({ error: error.message || `Failed to convert PDF to ${label}` });
     }
+  };
+}
 
-    const page = Math.max(1, parseInt(req.body.page, 10) || 1);
-    const images = await convertService.pdfToImages(req.files.pdf, "jpg");
-    const image = images[page - 1] ?? images[0];
-    if (!image) {
-      return res.status(500).json({ error: "No image generated" });
-    }
-
-    res.setHeader("Content-Type", "image/jpeg");
-    res.setHeader("Content-Disposition", `attachment; filename=page-${page}.jpg`);
-    res.send(image);
-  } catch (error) {
-    console.error("PDF to JPG error:", error);
-    res.status(500).json({ error: error.message || "Failed to convert PDF to JPG" });
-  }
-});
-
-// PDF to PNG — always returns a single image (page 1, or page specified by ?page=N)
-router.post("/pdf-to-png", async (req, res) => {
-  try {
-    if (!req.files || !req.files.pdf) {
-      return res.status(400).json({ error: "No PDF uploaded" });
-    }
-
-    const page = Math.max(1, parseInt(req.body.page, 10) || 1);
-    const images = await convertService.pdfToImages(req.files.pdf, "png");
-    const image = images[page - 1] ?? images[0];
-    if (!image) {
-      return res.status(500).json({ error: "No image generated" });
-    }
-
-    res.setHeader("Content-Type", "image/png");
-    res.setHeader("Content-Disposition", `attachment; filename=page-${page}.png`);
-    res.send(image);
-  } catch (error) {
-    console.error("PDF to PNG error:", error);
-    res.status(500).json({ error: error.message || "Failed to convert PDF to PNG" });
-  }
-});
+router.post("/pdf-to-jpg", pdfToImageRoute("jpg", "image/jpeg", "JPG"));
+router.post("/pdf-to-png", pdfToImageRoute("png", "image/png", "PNG"));
 
 // PDF to Text
 router.post("/pdf-to-text", async (req, res) => {
